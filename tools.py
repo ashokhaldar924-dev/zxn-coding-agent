@@ -1,251 +1,363 @@
-"""
-工具的"定义"（给模型看的 JSON Schema）和"执行"（本地真正跑的 Python 函数）
-放在一起，方便对照，也方便面试时讲清楚"模型只是发起请求，真正干活的是这里"。
+"""Seven local tools: schemas, implementations, registry, and dispatcher."""
 
-安全边界：
-1. 所有文件/命令类工具都被限制在 config.WORKSPACE_DIR 内，
-   防止模型（或者模型被诱导后）读写/执行工作区之外的东西。
-2. write_file 会先算出 unified diff 展示给用户看，run_command 会展示要执行的
-   命令，两者默认都需要用户在终端确认（y/N）才会真正落地——类似 Claude Code
-   的 permission prompt。可通过 AGENT_REQUIRE_CONFIRM=false 关闭（比如跑自动化
-   测试或无人值守 demo 时）。用户拒绝时不会抛异常，而是把"被拒绝"这个结果当作
-   正常的工具返回值喂回模型，让模型据此调整方案——这也是"错误处理"设计的延伸：
-   拒绝和报错走的是同一条"喂回模型自我修正"的路径。
-"""
+from __future__ import annotations
+
 import difflib
 import os
-import re
+from pathlib import Path
 import subprocess
+from typing import Callable
 
 import config
+from state import State, ToolRes
+import ui
 
 
-def _confirm(prompt: str) -> bool:
-    """
-    统一的确认入口。config.REQUIRE_CONFIRMATION=False 时直接放行
-    （单元测试、CI、无人值守场景用）；否则在终端阻塞询问用户。
-    """
-    if not config.REQUIRE_CONFIRMATION:
-        return True
-    answer = input(f"{prompt} [y/N]: ").strip().lower()
-    return answer in ("y", "yes")
+NOISE_DIRS = {".git", ".agent", "__pycache__", ".pytest_cache", ".venv", "node_modules"}
+MAX_READ_LINES = 200
+MAX_SEARCH_RESULTS = 30
+MAX_SEARCH_FILE_BYTES = 2_000_000
 
 
-def _resolve_safe_path(relative_path: str) -> str:
-    """
-    把用户/模型给的相对路径解析成绝对路径，并确保它没有跑出 WORKSPACE_DIR。
-    这是所有文件类工具共用的安全检查。
-    """
-    target = os.path.abspath(os.path.join(config.WORKSPACE_DIR, relative_path))
-    if not (target == config.WORKSPACE_DIR or target.startswith(config.WORKSPACE_DIR + os.sep)):
-        raise PermissionError(
-            f"拒绝访问：路径 '{relative_path}' 解析后跑出了工作区 {config.WORKSPACE_DIR}"
-        )
+def _root() -> Path:
+    return Path(config.WORKSPACE_DIR).resolve()
+
+
+def _resolve_safe_path(relative_path: str) -> Path:
+    if not isinstance(relative_path, str) or not relative_path.strip():
+        raise ValueError("path must be a non-empty string")
+    root = _root()
+    target = (root / relative_path).resolve(strict=False)
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise PermissionError(f"path escapes workspace: {relative_path!r}") from exc
     return target
 
 
-def _truncate(text: str) -> str:
-    if len(text) > config.MAX_TOOL_OUTPUT_CHARS:
-        return (
-            text[: config.MAX_TOOL_OUTPUT_CHARS]
-            + f"\n...(输出已截断，原始长度 {len(text)} 字符，超过上限 {config.MAX_TOOL_OUTPUT_CHARS})"
-        )
-    return text
+def _relative(path: Path) -> str:
+    return path.relative_to(_root()).as_posix() or "."
 
 
-# ---------- 具体工具实现 ----------
+def _confirm(prompt: str) -> bool:
+    if not config.REQUIRE_CONFIRMATION:
+        return True
+    try:
+        answer = input(f"{prompt} [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
 
-def tool_read_file(args: dict) -> str:
+
+def _clip(text: str) -> str:
+    limit = config.MAX_TOOL_CHARS
+    if len(text) <= limit:
+        return text
+    marker = f"\n[output truncated: {len(text)} chars total]\n"
+    if limit <= len(marker):
+        return marker[:limit]
+    room = max(0, limit - len(marker))
+    head = room // 2
+    tail = room - head
+    return text[:head] + marker + (text[-tail:] if tail else "")
+
+
+def _read_text(path: Path) -> str:
+    if not path.is_file():
+        raise FileNotFoundError(f"file not found: {_relative(path)}")
+    data = path.read_bytes()
+    if b"\x00" in data[:4096]:
+        raise ValueError(f"binary file is not supported: {_relative(path)}")
+    return data.decode("utf-8", errors="replace")
+
+
+def read_file(args: dict, st: State) -> ToolRes:
     path = _resolve_safe_path(args["path"])
-    if not os.path.isfile(path):
-        return f"错误：文件不存在 - {args['path']}"
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        content = f.read()
-    return _truncate(content)
+    text = _read_text(path)
+    lines = text.splitlines()
+    total = len(lines)
+    start = int(args.get("start", 1))
+    requested_end = args.get("end")
+    if start < 1:
+        raise ValueError("start must be >= 1")
+    if total == 0:
+        return ToolRes(f"{_relative(path)} 0-0 / 0\n\n(empty file)\n\n0 lines above, 0 lines below.")
+    if total and start > total:
+        raise ValueError(f"start {start} is past the end of the file ({total} lines)")
+    if requested_end is None:
+        end = min(total, start + MAX_READ_LINES - 1)
+    else:
+        end = int(requested_end)
+        if end < start:
+            raise ValueError("end must be >= start")
+    capped = end - start + 1 > MAX_READ_LINES
+    end = min(end, start + MAX_READ_LINES - 1, total)
+
+    shown = [f"{number} | {lines[number - 1]}" for number in range(start, end + 1)]
+    header = f"{_relative(path)} {start}-{end} / {total}"
+    footer = f"{max(0, start - 1)} lines above, {max(0, total - end)} lines below."
+    if capped:
+        footer += f" Requested range capped at {MAX_READ_LINES} lines."
+    return ToolRes(_clip(f"{header}\n\n" + "\n".join(shown) + f"\n\n{footer}"))
 
 
-def tool_write_file(args: dict) -> str:
-    path = _resolve_safe_path(args["path"])
-    new_content = args["content"]
-    append = bool(args.get("append"))
-
-    old_content = ""
-    if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            old_content = f.read()
-
-    preview_content = (old_content + new_content) if append else new_content
-    diff = "".join(
+def _diff(path: str, old: str, new: str) -> str:
+    lines = list(
         difflib.unified_diff(
-            old_content.splitlines(keepends=True),
-            preview_content.splitlines(keepends=True),
-            fromfile=f"a/{args['path']}",
-            tofile=f"b/{args['path']}",
+            old.splitlines(),
+            new.splitlines(),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="",
         )
     )
-    if diff:
-        print(f"\n--- 即将修改 {args['path']} ---\n{diff}")
-    else:
-        print(f"\n--- 即将创建新文件 {args['path']}（内容与旧文件相同或为新建）---")
-
-    if not _confirm(f"是否应用对 {args['path']} 的以上修改？"):
-        return f"用户拒绝了对 {args['path']} 的写入，文件未被修改"
-
-    mode = "a" if append else "w"
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, mode, encoding="utf-8") as f:
-        f.write(new_content)
-    action = "追加写入" if append else "覆盖写入"
-    return f"{action}成功：{args['path']}（{len(new_content)} 字符）"
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
-def tool_list_dir(args: dict) -> str:
-    path = _resolve_safe_path(args.get("path", "."))
-    if not os.path.isdir(path):
-        return f"错误：目录不存在 - {args.get('path', '.')}"
+def _apply_write(path: Path, old: str, new: str, st: State) -> ToolRes:
+    rel = _relative(path)
+    if old == new:
+        return ToolRes(f"No change: {rel}")
+    diff = _diff(rel, old, new)
+    print(f"\nProposed change: {rel}")
+    ui.show_diff(diff)
+    if not _confirm(f"Apply changes to {rel}?"):
+        return ToolRes(f"User rejected changes to {rel}; file was not modified.", rejected=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Write exact UTF-8 bytes so Windows newline translation cannot turn an
+    # existing CRLF into CRCRLF or make a no-op look like a content change.
+    path.write_bytes(new.encode("utf-8"))
+    st.rev += 1
+    st.changed = True
+    st.files.add(rel)
+    return ToolRes(f"Updated {rel}; workspace revision is now {st.rev}.")
+
+
+def write_file(args: dict, st: State) -> ToolRes:
+    path = _resolve_safe_path(args["path"])
+    if path.exists() and not path.is_file():
+        raise IsADirectoryError(f"not a file: {_relative(path)}")
+    new = args["content"]
+    if not isinstance(new, str):
+        raise ValueError("content must be a string")
+    old = _read_text(path) if path.exists() else ""
+    if path.exists() and old.replace("\r\n", "\n").replace("\r", "\n") == new.replace("\r\n", "\n").replace("\r", "\n"):
+        return ToolRes(f"No change: {_relative(path)}")
+    return _apply_write(path, old, new, st)
+
+
+def edit_file(args: dict, st: State) -> ToolRes:
+    path = _resolve_safe_path(args["path"])
+    old_fragment = args["old"]
+    new_fragment = args["new"]
+    if not isinstance(old_fragment, str) or not old_fragment:
+        raise ValueError("old must be a non-empty string")
+    if not isinstance(new_fragment, str):
+        raise ValueError("new must be a string")
+    current = _read_text(path)
+    count = current.count(old_fragment)
+    if count == 0 and "\r\n" in current and "\r" not in old_fragment:
+        native_old = old_fragment.replace("\n", "\r\n")
+        native_new = new_fragment.replace("\n", "\r\n")
+        native_count = current.count(native_old)
+        if native_count:
+            old_fragment, new_fragment, count = native_old, native_new, native_count
+    if count == 0:
+        raise ValueError("old text was not found; read the file again before editing")
+    if count > 1:
+        raise ValueError(
+            f"old text matched {count} times; include more surrounding context so it is unique"
+        )
+    proposed = current.replace(old_fragment, new_fragment, 1)
+    return _apply_write(path, current, proposed, st)
+
+
+def list_dir(args: dict, st: State) -> ToolRes:
+    path = _resolve_safe_path(args.get("path") or ".")
+    if not path.is_dir():
+        raise NotADirectoryError(f"directory not found: {_relative(path)}")
     entries = []
-    for name in sorted(os.listdir(path)):
-        full = os.path.join(path, name)
-        entries.append(("[DIR] " if os.path.isdir(full) else "      ") + name)
-    return _truncate("\n".join(entries) if entries else "(空目录)")
+    for item in sorted(path.iterdir(), key=lambda value: value.name.lower()):
+        if item.name in NOISE_DIRS:
+            continue
+        entries.append(f"[DIR] {item.name}" if item.is_dir() else item.name)
+    return ToolRes(_clip("\n".join(entries) if entries else "(empty directory)"))
 
 
-def tool_search_text(args: dict) -> str:
-    """在工作区内按正则搜索文本，类似简化版 grep -rn"""
-    pattern = re.compile(args["pattern"])
-    root = _resolve_safe_path(args.get("path", "."))
-    matches = []
+def _search_files(root: Path):
+    if root.is_file():
+        yield root
+        return
+    if not root.is_dir():
+        raise FileNotFoundError(f"path not found: {_relative(root)}")
     for dirpath, dirnames, filenames in os.walk(root):
-        # 跳过常见的大目录，避免搜索 .git / node_modules 浪费上下文
-        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__", ".venv")]
-        for fname in filenames:
-            fpath = os.path.join(dirpath, fname)
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                    for lineno, line in enumerate(f, start=1):
-                        if pattern.search(line):
-                            rel = os.path.relpath(fpath, config.WORKSPACE_DIR)
-                            matches.append(f"{rel}:{lineno}: {line.rstrip()}")
-                            if len(matches) >= 200:
-                                break
-            except (UnicodeDecodeError, OSError):
+        dirnames[:] = sorted(name for name in dirnames if name not in NOISE_DIRS)
+        for name in sorted(filenames):
+            yield Path(dirpath) / name
+
+
+def search_text(args: dict, st: State) -> ToolRes:
+    query = args["query"]
+    if not isinstance(query, str) or not query:
+        raise ValueError("query must be a non-empty string")
+    root = _resolve_safe_path(args.get("path") or ".")
+    shown: list[str] = []
+    count = 0
+    for path in _search_files(root):
+        try:
+            resolved = path.resolve(strict=False)
+            resolved.relative_to(_root())
+            if resolved.stat().st_size > MAX_SEARCH_FILE_BYTES:
                 continue
-        if len(matches) >= 200:
-            break
-    return _truncate("\n".join(matches) if matches else "(未找到匹配)")
+            data = resolved.read_bytes()
+            if b"\x00" in data[:4096]:
+                continue
+            text = data.decode("utf-8", errors="ignore")
+        except (OSError, ValueError):
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if query in line:
+                count += 1
+                if len(shown) < MAX_SEARCH_RESULTS:
+                    shown.append(f"{_relative(path)}:{lineno}: {line.rstrip()}")
+    if not count:
+        return ToolRes("No matches found.")
+    suffix = ""
+    if count > MAX_SEARCH_RESULTS:
+        suffix = f"\n\nFound {count} matches; showing first {MAX_SEARCH_RESULTS}. Narrow the query."
+    return ToolRes(_clip("\n".join(shown) + suffix))
 
 
-def tool_run_command(args: dict) -> str:
-    command = args["command"]
+def _timeout(args: dict) -> float:
+    requested = float(args.get("timeout", config.CMD_TIMEOUT))
+    if requested <= 0:
+        raise ValueError("timeout must be > 0")
+    return min(requested, config.CMD_TIMEOUT)
 
-    if not _confirm(f"是否执行命令：{command}"):
-        return f"用户拒绝执行命令：{command}"
 
+def _exec(cmd: str, timeout: float) -> ToolRes:
     try:
         proc = subprocess.run(
-            command,
+            cmd,
             shell=True,
             cwd=config.WORKSPACE_DIR,
             capture_output=True,
             text=True,
-            timeout=config.COMMAND_TIMEOUT_SECONDS,
+            errors="replace",
+            timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
-        return f"错误：命令执行超过 {config.COMMAND_TIMEOUT_SECONDS} 秒，已终止"
+    except subprocess.TimeoutExpired as exc:
+        return ToolRes(f"Command timed out after {timeout:g} seconds.", ok=False)
+    except OSError as exc:
+        return ToolRes(f"Command runtime error: {type(exc).__name__}: {exc}", ok=False)
 
-    output = f"退出码: {proc.returncode}\n"
+    parts = [f"exit code: {proc.returncode}"]
     if proc.stdout:
-        output += f"stdout:\n{proc.stdout}\n"
+        parts.append(f"stdout:\n{proc.stdout.rstrip()}")
     if proc.stderr:
-        output += f"stderr:\n{proc.stderr}\n"
-    return _truncate(output)
+        parts.append(f"stderr:\n{proc.stderr.rstrip()}")
+    return ToolRes(_clip("\n".join(parts)), rc=proc.returncode)
 
 
-# ---------- 注册表：name -> 执行函数 ----------
-TOOL_FUNCTIONS = {
-    "read_file": tool_read_file,
-    "write_file": tool_write_file,
-    "list_dir": tool_list_dir,
-    "search_text": tool_search_text,
-    "run_command": tool_run_command,
+def _command(args: dict, st: State, verify: bool) -> ToolRes:
+    cmd = args["cmd"]
+    if not isinstance(cmd, str) or not cmd.strip():
+        raise ValueError("cmd must be a non-empty string")
+    timeout = _timeout(args)
+    print(f"\nRun command:\n{cmd}")
+    if not _confirm("Execute this command?"):
+        return ToolRes(f"User rejected command: {cmd}", rejected=True)
+    result = _exec(cmd, timeout)
+    if verify and result.ok and not result.rejected and result.rc == 0:
+        st.ok_rev = st.rev
+        result.text += f"\nVerified workspace revision {st.rev}."
+    return result
+
+
+def run_command(args: dict, st: State) -> ToolRes:
+    return _command(args, st, verify=False)
+
+
+def check_command(args: dict, st: State) -> ToolRes:
+    return _command(args, st, verify=True)
+
+
+ToolFn = Callable[[dict, State], ToolRes]
+REG: dict[str, ToolFn] = {
+    "read_file": read_file,
+    "write_file": write_file,
+    "edit_file": edit_file,
+    "list_dir": list_dir,
+    "search_text": search_text,
+    "run_command": run_command,
+    "check_command": check_command,
 }
 
-# ---------- 注册表：给模型看的 JSON Schema（OpenAI / DeepSeek 通用格式） ----------
+
+def run_tool(name: str, args: dict, st: State) -> ToolRes:
+    if name not in REG:
+        return ToolRes(f"Unknown tool {name!r}. Available tools: {', '.join(REG)}", ok=False)
+    if not isinstance(args, dict):
+        return ToolRes("Tool arguments must be a JSON object.", ok=False)
+    try:
+        return REG[name](args, st)
+    except (KeyError, TypeError, ValueError, PermissionError, OSError) as exc:
+        return ToolRes(f"Tool error in {name}: {type(exc).__name__}: {exc}", ok=False)
+    except Exception as exc:  # runtime boundary: observations must not crash the agent
+        return ToolRes(f"Unexpected tool error in {name}: {type(exc).__name__}: {exc}", ok=False)
+
+
+def _schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+PATH = {"type": "string", "description": "Path relative to the workspace root."}
+CMD_PROPS = {
+    "cmd": {
+        "type": "string",
+        "description": (
+            f"Shell command for platform {os.name}. It already runs in the workspace; "
+            "do not prepend cd and do not inspect the private .agent directory."
+        ),
+    },
+    "timeout": {"type": "number", "description": "Optional timeout in seconds, capped by runtime configuration."},
+}
+
 TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "读取工作区内某个文本文件的完整内容",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "相对于工作区根目录的文件路径"},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "写入文件内容。默认覆盖整个文件；append=true 时追加到文件末尾。父目录不存在会自动创建。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "相对于工作区根目录的文件路径"},
-                    "content": {"type": "string", "description": "要写入的完整文本内容"},
-                    "append": {"type": "boolean", "description": "true 表示追加，false 或省略表示覆盖"},
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_dir",
-            "description": "列出工作区内某个目录下的文件和子目录",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "相对于工作区根目录的目录路径，省略则为根目录"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_text",
-            "description": "在工作区内递归搜索匹配正则表达式的代码/文本行，类似 grep -rn",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Python 正则表达式"},
-                    "path": {"type": "string", "description": "搜索起始目录，省略则为工作区根目录"},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_command",
-            "description": (
-                "在工作区目录下执行一条 shell 命令（比如运行测试、安装依赖、执行脚本），"
-                f"返回退出码、stdout、stderr。超时时间 {os.environ.get('AGENT_COMMAND_TIMEOUT', 30)} 秒。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "要执行的 shell 命令"},
-                },
-                "required": ["command"],
-            },
-        },
-    },
+    _schema("read_file", "Read up to 200 numbered lines from a workspace text file.", {
+        "path": PATH,
+        "start": {"type": "integer", "minimum": 1, "description": "First line, 1-based."},
+        "end": {"type": "integer", "minimum": 1, "description": "Optional inclusive final line."},
+    }, ["path"]),
+    _schema("write_file", "Create or replace a complete text file after showing a diff and requesting approval.", {
+        "path": PATH,
+        "content": {"type": "string", "description": "Complete new file content."},
+    }, ["path", "content"]),
+    _schema("edit_file", "Replace exactly one unique text fragment after showing a diff and requesting approval.", {
+        "path": PATH,
+        "old": {"type": "string", "description": "Non-empty text that must occur exactly once."},
+        "new": {"type": "string", "description": "Replacement text."},
+    }, ["path", "old", "new"]),
+    _schema("list_dir", "List one directory level while skipping common generated directories.", {"path": PATH}, []),
+    _schema("search_text", "Find a literal substring in workspace text files; returns at most 30 lines.", {
+        "query": {"type": "string", "description": "Literal, case-sensitive substring."},
+        "path": PATH,
+    }, ["query"]),
+    _schema("run_command", "Run an exploratory shell command locally after user approval.", CMD_PROPS, ["cmd"]),
+    _schema("check_command", "Run a user-approved check; exit code 0 verifies the current workspace revision.", CMD_PROPS, ["cmd"]),
 ]
+
+# Compatibility name for code that only needs to inspect the registry.
+TOOL_FUNCTIONS = REG
