@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+from permissions import PermissionManager
+
 
 @dataclass
 class ToolRes:
@@ -18,6 +20,7 @@ class ToolRes:
     ok: bool = True
     rc: int | None = None
     rejected: bool = False
+    blocked: bool = False
 
 
 @dataclass
@@ -31,3 +34,4 @@ class State:
     in_tok: int = 0
     out_tok: int = 0
     start: float = field(default_factory=time.time)
+    permissions: PermissionManager = field(default_factory=PermissionManager)

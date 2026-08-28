@@ -9,6 +9,7 @@ import subprocess
 from typing import Callable
 
 import config
+from permissions import Decision
 from state import State, ToolRes
 import ui
 
@@ -37,16 +38,6 @@ def _resolve_safe_path(relative_path: str) -> Path:
 
 def _relative(path: Path) -> str:
     return path.relative_to(_root()).as_posix() or "."
-
-
-def _confirm(prompt: str) -> bool:
-    if not config.REQUIRE_CONFIRMATION:
-        return True
-    try:
-        answer = input(f"{prompt} [y/N]: ").strip().lower()
-    except EOFError:
-        return False
-    return answer in {"y", "yes"}
 
 
 def _clip(text: str) -> str:
@@ -121,8 +112,11 @@ def _apply_write(path: Path, old: str, new: str, st: State) -> ToolRes:
     diff = _diff(rel, old, new)
     print(f"\nProposed change: {rel}")
     ui.show_diff(diff)
-    if not _confirm(f"Apply changes to {rel}?"):
-        return ToolRes(f"User rejected changes to {rel}; file was not modified.", rejected=True)
+    permission = st.permissions.authorize_edit(rel)
+    if permission.decision is Decision.DENY:
+        if permission.user_rejected:
+            return ToolRes(f"User rejected changes to {rel}; file was not modified.", rejected=True)
+        return ToolRes(f"Permission policy blocked changes to {rel}: {permission.reason}", blocked=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Write exact UTF-8 bytes so Windows newline translation cannot turn an
     # existing CRLF into CRCRLF or make a no-op look like a content change.
@@ -265,8 +259,11 @@ def _command(args: dict, st: State, verify: bool) -> ToolRes:
         raise ValueError("cmd must be a non-empty string")
     timeout = _timeout(args)
     print(f"\nRun command:\n{cmd}")
-    if not _confirm("Execute this command?"):
-        return ToolRes(f"User rejected command: {cmd}", rejected=True)
+    permission = st.permissions.authorize_command(cmd)
+    if permission.decision is Decision.DENY:
+        if permission.user_rejected:
+            return ToolRes(f"User rejected command: {cmd}", rejected=True)
+        return ToolRes(f"Permission policy blocked command: {permission.reason}", blocked=True)
     result = _exec(cmd, timeout)
     if verify and result.ok and not result.rejected and result.rc == 0:
         st.ok_rev = st.rev

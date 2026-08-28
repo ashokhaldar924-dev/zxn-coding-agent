@@ -174,11 +174,14 @@ def run_task(
                             ok=result.ok,
                             rc=result.rc,
                             rejected=result.rejected,
+                            blocked=result.blocked,
                             revision=st.rev,
                             verified_revision=st.ok_rev,
                         )
                         if result.rejected:
                             logger.event("user_rejection", step=step, id=call["id"], name=name)
+                        if result.blocked:
+                            logger.event("permission_block", step=step, id=call["id"], name=name)
                         st.errs = 0 if result.ok else st.errs + 1
                     ctx.add_group(group)
 
