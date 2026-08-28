@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+from gitguard import GitGuard
 from permissions import PermissionManager
 
 
@@ -35,3 +36,4 @@ class State:
     out_tok: int = 0
     start: float = field(default_factory=time.time)
     permissions: PermissionManager = field(default_factory=PermissionManager)
+    git_guard: GitGuard = field(default_factory=GitGuard)

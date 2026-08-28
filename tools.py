@@ -112,7 +112,10 @@ def _apply_write(path: Path, old: str, new: str, st: State) -> ToolRes:
     diff = _diff(rel, old, new)
     print(f"\nProposed change: {rel}")
     ui.show_diff(diff)
-    permission = st.permissions.authorize_edit(rel)
+    permission = st.permissions.authorize_edit(
+        rel,
+        initially_dirty=st.git_guard.is_initially_dirty(path),
+    )
     if permission.decision is Decision.DENY:
         if permission.user_rejected:
             return ToolRes(f"User rejected changes to {rel}; file was not modified.", rejected=True)

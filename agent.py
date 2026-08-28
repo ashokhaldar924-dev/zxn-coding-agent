@@ -12,6 +12,7 @@ from typing import Callable
 
 import config
 from ctx import Ctx
+from gitguard import GitGuard
 import llm
 from log import NullLog, RunLog
 from state import State, ToolRes
@@ -263,9 +264,23 @@ def main() -> int:
         print("No task supplied.")
         return 2
 
-    st = State()
+    git_guard = GitGuard.scan(config.WORKSPACE_DIR)
+    st = State(git_guard=git_guard)
+    initial_dirty = git_guard.display_paths(config.WORKSPACE_DIR)
+    if initial_dirty:
+        ui.warning(
+            "Git guard: preserving pre-existing changes in "
+            + ", ".join(initial_dirty[:10])
+            + (" ..." if len(initial_dirty) > 10 else "")
+        )
     logger = RunLog()
-    logger.event("task", text=task, workspace=config.WORKSPACE_DIR, model=config.MODEL_NAME)
+    logger.event(
+        "task",
+        text=task,
+        workspace=config.WORKSPACE_DIR,
+        model=config.MODEL_NAME,
+        initial_dirty=initial_dirty,
+    )
     ctx = Ctx(system_prompt(), task)
     try:
         final = run_task(ctx, st=st, logger=logger)

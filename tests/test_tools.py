@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config  # noqa: E402
+from gitguard import GitGuard  # noqa: E402
 from state import State  # noqa: E402
 import tools  # noqa: E402
 
@@ -127,6 +128,23 @@ class TestTools(unittest.TestCase):
         self.assertTrue(result.rejected)
         self.assertEqual(Path(self.tmpdir, "a.txt").read_text(encoding="utf-8"), "old")
         self.assertEqual(self.st.rev, 0)
+
+    def test_initially_dirty_file_requires_its_own_approval(self):
+        path = Path(self.tmpdir, "dirty.py")
+        path.write_text("old", encoding="utf-8")
+        self.st.git_guard = GitGuard(
+            repo_root=Path(self.tmpdir),
+            initial_dirty={path.resolve()},
+        )
+        self.st.permissions.allow_clean_edits = True
+        config.REQUIRE_CONFIRMATION = True
+        with mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(io.StringIO()):
+            result = self.run_tool(
+                "edit_file",
+                {"path": "dirty.py", "old": "old", "new": "new"},
+            )
+        self.assertTrue(result.rejected)
+        self.assertEqual(path.read_text(encoding="utf-8"), "old")
 
     def test_list_dir_skips_noise(self):
         Path(self.tmpdir, "visible.txt").write_text("x", encoding="utf-8")

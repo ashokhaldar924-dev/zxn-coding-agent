@@ -46,6 +46,16 @@ class TestPermissionManager(unittest.TestCase):
         self.assertTrue(second.user_rejected)
         self.assertEqual(ask.call_count, 2)
 
+    def test_dirty_file_needs_specific_session_approval(self):
+        self.permissions.allow_clean_edits = True
+        with mock.patch("builtins.input", return_value="a") as ask:
+            first = self.permissions.authorize_edit("dirty.py", initially_dirty=True)
+        second = self.permissions.authorize_edit("dirty.py", initially_dirty=True)
+        self.assertEqual(first.decision, Decision.ALLOW)
+        self.assertTrue(first.remembered)
+        self.assertEqual(second.decision, Decision.ALLOW)
+        ask.assert_called_once()
+
     def test_high_confidence_destructive_command_is_denied_without_prompt(self):
         with mock.patch("builtins.input") as ask:
             result = self.permissions.authorize_command("git reset --hard HEAD~1")
