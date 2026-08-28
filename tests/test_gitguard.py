@@ -53,6 +53,16 @@ class TestGitGuard(unittest.TestCase):
         self.assertFalse(guard.active)
         self.assertEqual(guard.initial_dirty, set())
 
+    def test_display_paths_omits_dirty_files_outside_workspace(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            workspace = repo / "sub"
+            workspace.mkdir()
+            inside = workspace / "inside.py"
+            outside = repo / "outside.py"
+            guard = GitGuard(repo_root=repo, initial_dirty={inside.resolve(), outside.resolve()})
+            self.assertEqual(guard.display_paths(workspace), ["inside.py"])
+
 
 if __name__ == "__main__":
     unittest.main()

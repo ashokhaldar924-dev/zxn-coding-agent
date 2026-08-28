@@ -26,7 +26,7 @@ class GitGuard:
             try:
                 shown.append(path.relative_to(base).as_posix())
             except ValueError:
-                shown.append(str(path))
+                continue
         return shown
 
     @classmethod

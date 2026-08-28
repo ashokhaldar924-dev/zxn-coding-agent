@@ -29,6 +29,20 @@ class TestPermissionManager(unittest.TestCase):
         self.assertEqual(second.decision, Decision.ALLOW)
         ask.assert_called_once()
 
+    def test_unapproved_effects_have_explicit_ask_decision(self):
+        self.assertEqual(
+            self.permissions.decide_edit("a.py").decision,
+            Decision.ASK,
+        )
+        self.assertEqual(
+            self.permissions.decide_edit("dirty.py", initially_dirty=True).decision,
+            Decision.ASK,
+        )
+        self.assertEqual(
+            self.permissions.decide_command("python -m unittest").decision,
+            Decision.ASK,
+        )
+
     def test_exact_command_session_approval_is_remembered(self):
         with mock.patch("builtins.input", return_value="a") as ask:
             first = self.permissions.authorize_command("python -m unittest")
@@ -59,7 +73,11 @@ class TestPermissionManager(unittest.TestCase):
     def test_high_confidence_destructive_command_is_denied_without_prompt(self):
         with mock.patch("builtins.input") as ask:
             result = self.permissions.authorize_command("git reset --hard HEAD~1")
+            windows = self.permissions.authorize_command(
+                "Remove-Item -LiteralPath C:\\ -Recurse -Force"
+            )
         self.assertEqual(result.decision, Decision.DENY)
+        self.assertEqual(windows.decision, Decision.DENY)
         self.assertFalse(result.user_rejected)
         ask.assert_not_called()
 

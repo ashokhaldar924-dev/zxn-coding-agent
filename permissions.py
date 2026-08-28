@@ -32,6 +32,22 @@ _DENIED_COMMANDS = [
         re.compile(r"\brm\s+-(?=[^\r\n]*r)(?=[^\r\n]*f)[^\r\n]*\s+(?:/|~)(?:\s|$)", re.IGNORECASE),
         "recursive deletion of a system or home root is denied",
     ),
+    (
+        re.compile(
+            r"\bRemove-Item\b(?=[^\r\n]*-Recurse)(?=[^\r\n]*-Force)"
+            r"(?=[^\r\n]*(?:[a-z]:\\(?:[\s\"']|$)|\$HOME(?:[\\/\s\"']|$)|~(?:[\\/\s\"']|$)))",
+            re.IGNORECASE,
+        ),
+        "recursive forced deletion of a drive or home root is denied",
+    ),
+    (
+        re.compile(
+            r"\b(?:rd|rmdir|del)\b(?=[^\r\n]*/s)(?=[^\r\n]*/q)"
+            r"(?=[^\r\n]*[a-z]:\\(?:[\s\"'*]|$))",
+            re.IGNORECASE,
+        ),
+        "recursive forced deletion of a drive root is denied",
+    ),
 ]
 
 
@@ -57,13 +73,23 @@ class PermissionManager:
                 return reason
         return None
 
-    def authorize_edit(self, path: str, *, initially_dirty: bool = False) -> PermissionResult:
+    def decide_edit(self, path: str, *, initially_dirty: bool = False) -> PermissionResult:
         if not config.REQUIRE_CONFIRMATION:
             return PermissionResult(Decision.ALLOW, "confirmation disabled for this run")
-
         if initially_dirty:
             if path in self.allowed_dirty_files:
                 return PermissionResult(Decision.ALLOW, "initially dirty file approved for this session")
+            return PermissionResult(Decision.ASK, "initially dirty file needs specific approval")
+        if self.allow_clean_edits:
+            return PermissionResult(Decision.ALLOW, "clean-file edits approved for this session")
+        return PermissionResult(Decision.ASK, "clean-file edit needs approval")
+
+    def authorize_edit(self, path: str, *, initially_dirty: bool = False) -> PermissionResult:
+        decision = self.decide_edit(path, initially_dirty=initially_dirty)
+        if decision.decision is not Decision.ASK:
+            return decision
+
+        if initially_dirty:
             answer = self._answer(
                 f"WARNING: {path} had user changes before this run. "
                 "Apply this change? [y] once / [a] allow this file for session / [N]: "
@@ -83,8 +109,6 @@ class PermissionManager:
                 user_rejected=True,
             )
 
-        if self.allow_clean_edits:
-            return PermissionResult(Decision.ALLOW, "clean-file edits approved for this session")
         answer = self._answer(
             f"Apply changes to {path}? [y] once / [a] allow clean-file edits for session / [N]: "
         )
@@ -103,16 +127,23 @@ class PermissionManager:
             user_rejected=True,
         )
 
-    def authorize_command(self, cmd: str) -> PermissionResult:
+    def decide_command(self, cmd: str) -> PermissionResult:
         denied_reason = self._denied_command_reason(cmd)
         if denied_reason:
             return PermissionResult(Decision.DENY, denied_reason)
         if not config.REQUIRE_CONFIRMATION:
             return PermissionResult(Decision.ALLOW, "confirmation disabled for this run")
-
         normalized = cmd.strip()
         if normalized in self.allowed_commands:
             return PermissionResult(Decision.ALLOW, "exact command approved for this session")
+        return PermissionResult(Decision.ASK, "command needs approval")
+
+    def authorize_command(self, cmd: str) -> PermissionResult:
+        decision = self.decide_command(cmd)
+        if decision.decision is not Decision.ASK:
+            return decision
+
+        normalized = cmd.strip()
         answer = self._answer(
             "Execute this command? [y] once / [a] allow this exact command for session / [N]: "
         )
