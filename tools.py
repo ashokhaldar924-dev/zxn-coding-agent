@@ -1,10 +1,12 @@
-"""Seven local tools: schemas, implementations, registry, and dispatcher."""
+"""Eight local tools: schemas, implementations, registry, and dispatcher."""
 
 from __future__ import annotations
 
 import difflib
+import fnmatch
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Callable
 
@@ -17,6 +19,7 @@ import ui
 NOISE_DIRS = {".git", ".agent", "__pycache__", ".pytest_cache", ".venv", "node_modules"}
 MAX_READ_LINES = 200
 MAX_SEARCH_RESULTS = 30
+MAX_GLOB_RESULTS = 100
 MAX_SEARCH_FILE_BYTES = 2_000_000
 
 
@@ -197,6 +200,13 @@ def search_text(args: dict, st: State) -> ToolRes:
     query = args["query"]
     if not isinstance(query, str) or not query:
         raise ValueError("query must be a non-empty string")
+    regex = args.get("regex", False)
+    if not isinstance(regex, bool):
+        raise ValueError("regex must be true or false")
+    try:
+        pattern = re.compile(query) if regex else None
+    except re.error as exc:
+        raise ValueError(f"invalid regular expression: {exc}") from exc
     root = _resolve_safe_path(args.get("path") or ".")
     shown: list[str] = []
     count = 0
@@ -213,7 +223,7 @@ def search_text(args: dict, st: State) -> ToolRes:
         except (OSError, ValueError):
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
-            if query in line:
+            if (pattern.search(line) if pattern else query in line):
                 count += 1
                 if len(shown) < MAX_SEARCH_RESULTS:
                     shown.append(f"{_relative(path)}:{lineno}: {line.rstrip()}")
@@ -223,6 +233,45 @@ def search_text(args: dict, st: State) -> ToolRes:
     if count > MAX_SEARCH_RESULTS:
         suffix = f"\n\nFound {count} matches; showing first {MAX_SEARCH_RESULTS}. Narrow the query."
     return ToolRes(_clip("\n".join(shown) + suffix))
+
+
+def _glob_match(path: str, pattern: str) -> bool:
+    if fnmatch.fnmatchcase(path, pattern):
+        return True
+    return pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:])
+
+
+def glob_files(args: dict, st: State) -> ToolRes:
+    pattern = args["pattern"]
+    if not isinstance(pattern, str) or not pattern.strip():
+        raise ValueError("pattern must be a non-empty string")
+    pattern = pattern.replace("\\", "/")
+    pattern_path = Path(pattern)
+    if pattern_path.is_absolute() or ".." in pattern_path.parts:
+        raise PermissionError("glob pattern must stay relative to its search root")
+    root = _resolve_safe_path(args.get("path") or ".")
+    if not root.exists():
+        raise FileNotFoundError(f"path not found: {_relative(root)}")
+
+    matches: list[str] = []
+    count = 0
+    for path in _search_files(root):
+        try:
+            resolved = path.resolve(strict=False)
+            resolved.relative_to(_root())
+            relative_to_search = resolved.relative_to(root).as_posix() if root.is_dir() else resolved.name
+        except (OSError, ValueError):
+            continue
+        if _glob_match(relative_to_search, pattern):
+            count += 1
+            if len(matches) < MAX_GLOB_RESULTS:
+                matches.append(_relative(resolved))
+    if not count:
+        return ToolRes("No files matched.")
+    suffix = ""
+    if count > MAX_GLOB_RESULTS:
+        suffix = f"\n\nFound {count} files; showing first {MAX_GLOB_RESULTS}. Narrow the pattern."
+    return ToolRes(_clip("\n".join(matches) + suffix))
 
 
 def _timeout(args: dict) -> float:
@@ -288,6 +337,7 @@ REG: dict[str, ToolFn] = {
     "write_file": write_file,
     "edit_file": edit_file,
     "list_dir": list_dir,
+    "glob_files": glob_files,
     "search_text": search_text,
     "run_command": run_command,
     "check_command": check_command,
@@ -351,9 +401,14 @@ TOOL_SCHEMAS = [
         "new": {"type": "string", "description": "Replacement text."},
     }, ["path", "old", "new"]),
     _schema("list_dir", "List one directory level while skipping common generated directories.", {"path": PATH}, []),
-    _schema("search_text", "Find a literal substring in workspace text files; returns at most 30 lines.", {
-        "query": {"type": "string", "description": "Literal, case-sensitive substring."},
+    _schema("glob_files", "Find workspace files by a relative glob pattern; returns at most 100 paths.", {
+        "pattern": {"type": "string", "description": "Relative glob such as **/*.py or tests/test_*.py."},
         "path": PATH,
+    }, ["pattern"]),
+    _schema("search_text", "Find literal or regex matches in workspace text files; returns at most 30 lines.", {
+        "query": {"type": "string", "description": "Case-sensitive literal text, or a Python regular expression when regex=true."},
+        "path": PATH,
+        "regex": {"type": "boolean", "description": "Interpret query as a Python regular expression. Defaults to false."},
     }, ["query"]),
     _schema("run_command", "Run an exploratory shell command locally after user approval.", CMD_PROPS, ["cmd"]),
     _schema("check_command", "Run a user-approved check; exit code 0 verifies the current workspace revision.", CMD_PROPS, ["cmd"]),

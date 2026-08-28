@@ -41,10 +41,10 @@ class TestTools(unittest.TestCase):
     def run_tool(self, name, args):
         return tools.run_tool(name, args, self.st)
 
-    def test_registry_has_exactly_seven_tools(self):
+    def test_registry_has_exactly_eight_tools(self):
         self.assertEqual(
             list(tools.REG),
-            ["read_file", "write_file", "edit_file", "list_dir", "search_text", "run_command", "check_command"],
+            ["read_file", "write_file", "edit_file", "list_dir", "glob_files", "search_text", "run_command", "check_command"],
         )
 
     def test_safe_path_and_traversal(self):
@@ -172,6 +172,38 @@ class TestTools(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIn("Found 40 matches; showing first 30", result.text)
         self.assertEqual(sum(": needle " in line for line in result.text.splitlines()), 30)
+
+    def test_search_regex_and_invalid_pattern(self):
+        Path(self.tmpdir, "code.py").write_text(
+            "class FirstHandler:\n    pass\nclass Other:\n    pass\n",
+            encoding="utf-8",
+        )
+        result = self.run_tool(
+            "search_text",
+            {"query": r"^class .*Handler:", "regex": True},
+        )
+        invalid = self.run_tool(
+            "search_text",
+            {"query": "(", "regex": True},
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("code.py:1: class FirstHandler:", result.text)
+        self.assertFalse(invalid.ok)
+        self.assertIn("invalid regular expression", invalid.text)
+
+    def test_glob_files_is_bounded_and_rejects_parent_patterns(self):
+        Path(self.tmpdir, "root.py").write_text("", encoding="utf-8")
+        Path(self.tmpdir, "src").mkdir()
+        Path(self.tmpdir, "src", "nested.py").write_text("", encoding="utf-8")
+        Path(self.tmpdir, "src", "note.txt").write_text("", encoding="utf-8")
+        Path(self.tmpdir, ".git").mkdir()
+        Path(self.tmpdir, ".git", "hidden.py").write_text("", encoding="utf-8")
+        result = self.run_tool("glob_files", {"pattern": "**/*.py"})
+        escaped = self.run_tool("glob_files", {"pattern": "../*.py"})
+        self.assertTrue(result.ok)
+        self.assertEqual(result.text.splitlines(), ["root.py", "src/nested.py"])
+        self.assertFalse(escaped.ok)
+        self.assertIn("must stay relative", escaped.text)
 
     def test_run_success_nonzero_and_rejection(self):
         success = self.run_tool("run_command", {"cmd": f'"{sys.executable}" -c "print(123)"'})
