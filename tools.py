@@ -1,26 +1,28 @@
-"""Eight local tools: schemas, implementations, registry, and dispatcher."""
+"""Nine local tools: schemas, implementations, registry, and dispatcher."""
 
 from __future__ import annotations
 
+import ast
 import difflib
 import fnmatch
 import os
-from pathlib import Path
 import re
 import subprocess
-from typing import Callable
+from collections.abc import Callable
+from pathlib import Path
 
 import config
+import ui
 from permissions import Decision
 from state import State, ToolRes
-import ui
-
 
 NOISE_DIRS = {".git", ".agent", "__pycache__", ".pytest_cache", ".venv", "node_modules"}
 MAX_READ_LINES = 200
 MAX_SEARCH_RESULTS = 30
 MAX_GLOB_RESULTS = 100
 MAX_SEARCH_FILE_BYTES = 2_000_000
+MAX_REPO_MAP_FILES = 200
+MAX_REPO_MAP_SYMBOLS = 500
 
 
 def _root() -> Path:
@@ -33,9 +35,11 @@ def _resolve_safe_path(relative_path: str) -> Path:
     root = _root()
     target = (root / relative_path).resolve(strict=False)
     try:
-        target.relative_to(root)
+        relative = target.relative_to(root)
     except ValueError as exc:
         raise PermissionError(f"path escapes workspace: {relative_path!r}") from exc
+    if relative.parts and relative.parts[0] == ".agent":
+        raise PermissionError("the private .agent runtime directory is not available to tools")
     return target
 
 
@@ -127,14 +131,30 @@ def _apply_write(path: Path, old: str, new: str, st: State) -> ToolRes:
             blocked=True,
             block_kind="permission",
         )
+    existed = path.exists()
+    prepared = None
+    new_bytes = new.encode("utf-8")
+    if st.checkpoints is not None:
+        prepared = st.checkpoints.prepare(
+            rel,
+            path.read_bytes() if existed else None,
+            new_bytes,
+            st.rev,
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     # Write exact UTF-8 bytes so Windows newline translation cannot turn an
     # existing CRLF into CRCRLF or make a no-op look like a content change.
-    path.write_bytes(new.encode("utf-8"))
+    path.write_bytes(new_bytes)
     st.rev += 1
     st.changed = True
     st.files.add(rel)
-    return ToolRes(f"Updated {rel}; workspace revision is now {st.rev}.")
+    checkpoint_text = ""
+    if prepared is not None:
+        st.checkpoints.commit(prepared, st.rev)
+        checkpoint_text = f" Checkpoint: {prepared.checkpoint_id}."
+    return ToolRes(
+        f"Updated {rel}; workspace revision is now {st.rev}.{checkpoint_text}"
+    )
 
 
 def write_file(args: dict, st: State) -> ToolRes:
@@ -143,7 +163,7 @@ def write_file(args: dict, st: State) -> ToolRes:
         raise IsADirectoryError(f"not a file: {_relative(path)}")
     new = args["content"]
     if not isinstance(new, str):
-        raise ValueError("content must be a string")
+        raise TypeError("content must be a string")
     old = _read_text(path) if path.exists() else ""
     if path.exists() and old.replace("\r\n", "\n").replace("\r", "\n") == new.replace("\r\n", "\n").replace("\r", "\n"):
         return ToolRes(f"No change: {_relative(path)}")
@@ -157,7 +177,7 @@ def edit_file(args: dict, st: State) -> ToolRes:
     if not isinstance(old_fragment, str) or not old_fragment:
         raise ValueError("old must be a non-empty string")
     if not isinstance(new_fragment, str):
-        raise ValueError("new must be a string")
+        raise TypeError("new must be a string")
     current = _read_text(path)
     count = current.count(old_fragment)
     if count == 0 and "\r\n" in current and "\r" not in old_fragment:
@@ -206,7 +226,7 @@ def search_text(args: dict, st: State) -> ToolRes:
         raise ValueError("query must be a non-empty string")
     regex = args.get("regex", False)
     if not isinstance(regex, bool):
-        raise ValueError("regex must be true or false")
+        raise TypeError("regex must be true or false")
     try:
         pattern = re.compile(query) if regex else None
     except re.error as exc:
@@ -278,6 +298,84 @@ def glob_files(args: dict, st: State) -> ToolRes:
     return ToolRes(_clip("\n".join(matches) + suffix))
 
 
+def _argument_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    args = [argument.arg for argument in [*node.args.posonlyargs, *node.args.args]]
+    if node.args.vararg:
+        args.append("*" + node.args.vararg.arg)
+    elif node.args.kwonlyargs:
+        args.append("*")
+    args.extend(argument.arg for argument in node.args.kwonlyargs)
+    if node.args.kwarg:
+        args.append("**" + node.args.kwarg.arg)
+    return ", ".join(args)
+
+
+def _symbol_line(node: ast.AST, indent: str = "  ") -> str:
+    if isinstance(node, ast.ClassDef):
+        bases = []
+        for base in node.bases[:3]:
+            bases.append(ast.unparse(base))
+        suffix = f"({', '.join(bases)})" if bases else ""
+        return f"{indent}L{node.lineno} class {node.name}{suffix}"
+    async_prefix = "async " if isinstance(node, ast.AsyncFunctionDef) else ""
+    return f"{indent}L{node.lineno} {async_prefix}def {node.name}({_argument_names(node)})"
+
+
+def repo_map(args: dict, st: State) -> ToolRes:
+    """Build an on-demand Python symbol overview using the standard AST."""
+
+    root = _resolve_safe_path(args.get("path") or ".")
+    python_files = [path for path in _search_files(root) if path.suffix.lower() == ".py"]
+    total_files = len(python_files)
+    files = python_files[:MAX_REPO_MAP_FILES]
+    lines: list[str] = []
+    symbols = 0
+    parse_errors = 0
+    for path in files:
+        try:
+            text = _read_text(path)
+            tree = ast.parse(text, filename=_relative(path))
+        except (OSError, SyntaxError, UnicodeError, ValueError):
+            parse_errors += 1
+            continue
+
+        file_lines: list[str] = []
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                if symbols >= MAX_REPO_MAP_SYMBOLS:
+                    break
+                file_lines.append(_symbol_line(node))
+                symbols += 1
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if symbols >= MAX_REPO_MAP_SYMBOLS:
+                            break
+                        file_lines.append(_symbol_line(child, indent="    "))
+                        symbols += 1
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if symbols >= MAX_REPO_MAP_SYMBOLS:
+                    break
+                file_lines.append(_symbol_line(node))
+                symbols += 1
+        if file_lines:
+            lines.append(f"{_relative(path)}\n" + "\n".join(file_lines))
+        if symbols >= MAX_REPO_MAP_SYMBOLS:
+            break
+
+    header = f"Python repo map: {symbols} symbols from {len(files)} / {total_files} files."
+    notes = []
+    if total_files > MAX_REPO_MAP_FILES:
+        notes.append(f"file scan capped at {MAX_REPO_MAP_FILES}")
+    if symbols >= MAX_REPO_MAP_SYMBOLS:
+        notes.append(f"symbol output capped at {MAX_REPO_MAP_SYMBOLS}")
+    if parse_errors:
+        notes.append(f"{parse_errors} files skipped because they could not be parsed")
+    if notes:
+        header += " " + "; ".join(notes) + "."
+    body = "\n\n".join(lines) if lines else "No Python class or function symbols found."
+    return ToolRes(_clip(header + "\n\n" + body))
+
+
 def _timeout(args: dict) -> float:
     requested = float(args.get("timeout", config.CMD_TIMEOUT))
     if requested <= 0:
@@ -295,8 +393,9 @@ def _exec(cmd: str, timeout: float) -> ToolRes:
             text=True,
             errors="replace",
             timeout=timeout,
+            check=False,
         )
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         return ToolRes(f"Command timed out after {timeout:g} seconds.", ok=False)
     except OSError as exc:
         return ToolRes(f"Command runtime error: {type(exc).__name__}: {exc}", ok=False)
@@ -307,6 +406,15 @@ def _exec(cmd: str, timeout: float) -> ToolRes:
     if proc.stderr:
         parts.append(f"stderr:\n{proc.stderr.rstrip()}")
     return ToolRes(_clip("\n".join(parts)), rc=proc.returncode)
+
+
+def run_user_command(cmd: str, timeout: float | None = None) -> ToolRes:
+    """Run a command explicitly entered by the human in interactive shell mode."""
+
+    if not isinstance(cmd, str) or not cmd.strip():
+        return ToolRes("User command must not be empty.", ok=False)
+    chosen_timeout = config.CMD_TIMEOUT if timeout is None else min(timeout, config.CMD_TIMEOUT)
+    return _exec(cmd, chosen_timeout)
 
 
 def _command(args: dict, st: State, verify: bool) -> ToolRes:
@@ -325,9 +433,20 @@ def _command(args: dict, st: State, verify: bool) -> ToolRes:
             block_kind="permission",
         )
     result = _exec(cmd, timeout)
-    if verify and result.ok and not result.rejected and result.rc == 0:
-        st.ok_rev = st.rev
-        result.text += f"\nVerified workspace revision {st.rev}."
+    if verify and result.ok and not result.rejected:
+        st.ok_rev = -1
+        st.last_check_cmd = cmd
+        st.last_check_rc = result.rc
+        st.last_check_rev = st.rev
+        if result.rc == 0:
+            if st.required_verifier and cmd.strip() != st.required_verifier.strip():
+                result.text += (
+                    "\nCheck passed, but it did not satisfy the configured final verifier. "
+                    f"Use check_command with exactly: {st.required_verifier}"
+                )
+            else:
+                st.ok_rev = st.rev
+                result.text += f"\nVerified workspace revision {st.rev}."
     return result
 
 
@@ -346,6 +465,7 @@ REG: dict[str, ToolFn] = {
     "edit_file": edit_file,
     "list_dir": list_dir,
     "glob_files": glob_files,
+    "repo_map": repo_map,
     "search_text": search_text,
     "run_command": run_command,
     "check_command": check_command,
@@ -361,7 +481,7 @@ def run_tool(name: str, args: dict, st: State) -> ToolRes:
         return REG[name](args, st)
     except (KeyError, TypeError, ValueError, PermissionError, OSError) as exc:
         return ToolRes(f"Tool error in {name}: {type(exc).__name__}: {exc}", ok=False)
-    except Exception as exc:  # runtime boundary: observations must not crash the agent
+    except Exception as exc:  # noqa: BLE001 - tool boundary must become an observation
         return ToolRes(f"Unexpected tool error in {name}: {type(exc).__name__}: {exc}", ok=False)
 
 
@@ -413,6 +533,9 @@ TOOL_SCHEMAS = [
         "pattern": {"type": "string", "description": "Relative glob such as **/*.py or tests/test_*.py."},
         "path": PATH,
     }, ["pattern"]),
+    _schema("repo_map", "Summarize Python classes, functions, methods, and line numbers using the local AST.", {
+        "path": PATH,
+    }, []),
     _schema("search_text", "Find literal or regex matches in workspace text files; returns at most 30 lines.", {
         "query": {"type": "string", "description": "Case-sensitive literal text, or a Python regular expression when regex=true."},
         "path": PATH,

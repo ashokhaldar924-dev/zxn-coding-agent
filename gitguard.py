@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-import subprocess
 
 
 @dataclass
@@ -30,7 +30,7 @@ class GitGuard:
         return shown
 
     @classmethod
-    def scan(cls, workspace: str | Path) -> "GitGuard":
+    def scan(cls, workspace: str | Path) -> GitGuard:
         """Capture Git's initial dirty set; silently disable outside a repository."""
 
         cwd = str(Path(workspace).resolve())
@@ -42,6 +42,7 @@ class GitGuard:
                 encoding="utf-8",
                 errors="replace",
                 timeout=5,
+                check=False,
             )
             if root_result.returncode != 0:
                 return cls()
@@ -53,6 +54,7 @@ class GitGuard:
                 encoding="utf-8",
                 errors="replace",
                 timeout=10,
+                check=False,
             )
             if status_result.returncode != 0:
                 return cls(repo_root=repo_root)

@@ -61,10 +61,9 @@ def call(msgs: list[dict], schemas: list[dict]) -> tuple[dict, dict]:
                 f"Model request failed: {type(exc).__name__}: {_safe_text(str(exc))}"
             ) from exc
 
-        if response.status_code == 429 or response.status_code >= 500:
-            if attempt < 2:
-                time.sleep(0.5 * (attempt + 1))
-                continue
+        if (response.status_code == 429 or response.status_code >= 500) and attempt < 2:
+            time.sleep(0.5 * (attempt + 1))
+            continue
         break
 
     assert response is not None

@@ -51,10 +51,12 @@ MAX_TIME = _float("AGENT_MAX_TIME", 600.0)
 MAX_TOOL_CHARS = _int("AGENT_MAX_TOOL_CHARS", 12_000)
 MAX_GROUPS = _int("AGENT_MAX_GROUPS", 8)
 MAX_CONTEXT_CHARS = _int("AGENT_MAX_CONTEXT_CHARS", 60_000)
+MAX_CONTEXT_TOKENS = _int("AGENT_MAX_CONTEXT_TOKENS", 32_000)
 CONTEXT_KEEP_FULL_GROUPS = _int("AGENT_CONTEXT_KEEP_FULL_GROUPS", 1)
 if CONTEXT_KEEP_FULL_GROUPS > MAX_GROUPS:
     raise RuntimeError("AGENT_CONTEXT_KEEP_FULL_GROUPS cannot exceed AGENT_MAX_GROUPS")
 MAX_PROJECT_CONTEXT_CHARS = _int("AGENT_MAX_PROJECT_CONTEXT_CHARS", 12_000)
+MAX_FILE_REFERENCE_CHARS = _int("AGENT_MAX_FILE_REFERENCE_CHARS", 12_000)
 CMD_TIMEOUT = _float("AGENT_CMD_TIMEOUT", 60.0)
 MAX_ERRORS = _int("AGENT_MAX_ERRORS", 4)
 MAX_IDENTICAL_CALLS = _int("AGENT_MAX_IDENTICAL_CALLS", 3, minimum=2)
@@ -74,3 +76,28 @@ def get_model() -> str:
     if not MODEL_NAME:
         raise RuntimeError("Missing AGENT_MODEL. Set it to a model supported by your endpoint.")
     return MODEL_NAME
+
+
+def get_final_verifier(workspace: str | Path | None = None) -> str | None:
+    """Load an optional user/project-selected command for the final gate."""
+
+    value = os.environ.get("AGENT_FINAL_VERIFIER", "").strip()
+    if value:
+        if len(value) > 2_000:
+            raise RuntimeError("AGENT_FINAL_VERIFIER must be at most 2000 characters")
+        return value
+
+    root = Path(workspace or WORKSPACE_DIR).resolve()
+    path = root / ".agent-verifier"
+    if not path.is_file():
+        return None
+    data = path.read_bytes()
+    if len(data) > 2_000 or b"\x00" in data:
+        raise RuntimeError(".agent-verifier must be a text command of at most 2000 bytes")
+    try:
+        value = data.decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(".agent-verifier must be valid UTF-8 text") from exc
+    if not value:
+        raise RuntimeError(".agent-verifier must contain a non-empty command")
+    return value

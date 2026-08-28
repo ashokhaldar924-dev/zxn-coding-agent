@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 
 
 @dataclass
@@ -13,6 +13,12 @@ class RepetitionGuard:
     limit: int
     last_fingerprint: str | None = None
     count: int = 0
+
+    def reset(self) -> None:
+        """Forget only per-turn repetition state."""
+
+        self.last_fingerprint = None
+        self.count = 0
 
     def check(self, name: str, args: dict) -> str | None:
         fingerprint = name + ":" + json.dumps(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import shutil
 import sys
 import tempfile
@@ -19,14 +18,17 @@ class TestContext(unittest.TestCase):
     def setUp(self):
         self.old_groups = config.MAX_GROUPS
         self.old_chars = config.MAX_CONTEXT_CHARS
+        self.old_tokens = config.MAX_CONTEXT_TOKENS
         self.old_keep = config.CONTEXT_KEEP_FULL_GROUPS
         config.MAX_GROUPS = 2
         config.MAX_CONTEXT_CHARS = 60_000
+        config.MAX_CONTEXT_TOKENS = 32_000
         config.CONTEXT_KEEP_FULL_GROUPS = 1
 
     def tearDown(self):
         config.MAX_GROUPS = self.old_groups
         config.MAX_CONTEXT_CHARS = self.old_chars
+        config.MAX_CONTEXT_TOKENS = self.old_tokens
         config.CONTEXT_KEEP_FULL_GROUPS = self.old_keep
 
     def test_head_is_always_preserved(self):
@@ -122,6 +124,38 @@ class TestContext(unittest.TestCase):
         self.assertIn("LATEST-", json.dumps(messages))
         self.assertEqual(ctx.last_stats.pruned_tool_outputs, 0)
         self.assertTrue(ctx.last_stats.over_budget)
+
+    def test_token_budget_prunes_even_when_character_budget_is_large(self):
+        config.MAX_CONTEXT_CHARS = 1_000_000
+        config.MAX_CONTEXT_TOKENS = 180
+        ctx = Ctx("system", "task")
+        ctx.add_group([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "old", "function": {"name": "read_file", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "old", "content": "old-output-" + "X" * 2_000},
+        ])
+        ctx.add_group([{"role": "assistant", "content": "recent"}])
+        messages = ctx.build("runtime-anchor")
+        self.assertNotIn("old-output-", json.dumps(messages))
+        self.assertIn("runtime-anchor", json.dumps(messages))
+        self.assertLessEqual(ctx.last_stats.after_tokens, ctx.last_stats.before_tokens)
+
+    def test_multi_turn_history_is_durable_but_current_task_stays_anchored(self):
+        config.MAX_GROUPS = 2
+        ctx = Ctx("system", "first task")
+        ctx.add_group([{"role": "assistant", "content": "first answer"}])
+        ctx.start_task("second task")
+        ctx.add_group([{"role": "assistant", "content": "second answer"}])
+
+        self.assertIn("first task", json.dumps(ctx.history_groups))
+        messages = ctx.build("state")
+        serialized = json.dumps(messages)
+        self.assertIn("second task", serialized)
+        self.assertIn("second answer", serialized)
+        self.assertIn("state", serialized)
 
 
 class TestRunLog(unittest.TestCase):

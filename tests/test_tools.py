@@ -41,17 +41,20 @@ class TestTools(unittest.TestCase):
     def run_tool(self, name, args):
         return tools.run_tool(name, args, self.st)
 
-    def test_registry_has_exactly_eight_tools(self):
+    def test_registry_has_exactly_nine_tools(self):
         self.assertEqual(
             list(tools.REG),
-            ["read_file", "write_file", "edit_file", "list_dir", "glob_files", "search_text", "run_command", "check_command"],
+            ["read_file", "write_file", "edit_file", "list_dir", "glob_files", "repo_map", "search_text", "run_command", "check_command"],
         )
 
     def test_safe_path_and_traversal(self):
         self.assertEqual(tools._resolve_safe_path("a.txt"), Path(self.tmpdir) / "a.txt")
         result = self.run_tool("read_file", {"path": "../outside.txt"})
+        private = self.run_tool("read_file", {"path": ".agent/session.jsonl"})
         self.assertFalse(result.ok)
         self.assertIn("escapes workspace", result.text)
+        self.assertFalse(private.ok)
+        self.assertIn("private .agent", private.text)
 
     def test_read_range_and_200_line_cap(self):
         Path(self.tmpdir, "lines.txt").write_text(
@@ -205,6 +208,24 @@ class TestTools(unittest.TestCase):
         self.assertFalse(escaped.ok)
         self.assertIn("must stay relative", escaped.text)
 
+    def test_repo_map_extracts_python_classes_functions_methods_and_lines(self):
+        Path(self.tmpdir, "module.py").write_text(
+            "def top(a, b):\n"
+            "    return a + b\n\n"
+            "class Worker(Base):\n"
+            "    async def run(self, item):\n"
+            "        return item\n",
+            encoding="utf-8",
+        )
+        Path(self.tmpdir, "broken.py").write_text("def broken(:\n", encoding="utf-8")
+        result = self.run_tool("repo_map", {"path": "."})
+        self.assertTrue(result.ok)
+        self.assertIn("module.py", result.text)
+        self.assertIn("L1 def top(a, b)", result.text)
+        self.assertIn("L4 class Worker(Base)", result.text)
+        self.assertIn("L5 async def run(self, item)", result.text)
+        self.assertIn("could not be parsed", result.text)
+
     def test_run_success_nonzero_and_rejection(self):
         success = self.run_tool("run_command", {"cmd": f'"{sys.executable}" -c "print(123)"'})
         nonzero = self.run_tool("run_command", {"cmd": f'"{sys.executable}" -c "raise SystemExit(7)"'})
@@ -259,6 +280,32 @@ class TestTools(unittest.TestCase):
             rejected = self.run_tool("check_command", {"cmd": "echo no"})
         self.assertTrue(rejected.rejected)
         self.assertEqual(self.st.ok_rev, 3)
+
+    def test_configured_final_verifier_must_match_and_latest_failure_invalidates(self):
+        flag = Path(self.tmpdir, "flag.txt")
+        flag.write_text("ok", encoding="utf-8")
+        required = (
+            f'"{sys.executable}" -c "import pathlib,sys; '
+            "sys.exit(pathlib.Path('flag.txt').read_text() != 'ok')\""
+        )
+        self.st.rev = 2
+        self.st.required_verifier = required
+        other = self.run_tool(
+            "check_command",
+            {"cmd": f'"{sys.executable}" -c "print(\'other\')"'},
+        )
+        self.assertEqual(other.rc, 0)
+        self.assertEqual(self.st.ok_rev, -1)
+        self.assertIn("did not satisfy", other.text)
+
+        passed = self.run_tool("check_command", {"cmd": required})
+        self.assertEqual(self.st.ok_rev, 2)
+        self.assertIn("Verified workspace revision 2", passed.text)
+
+        flag.write_text("bad", encoding="utf-8")
+        failed = self.run_tool("check_command", {"cmd": required})
+        self.assertEqual(failed.rc, 1)
+        self.assertEqual(self.st.ok_rev, -1)
 
 
 if __name__ == "__main__":

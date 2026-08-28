@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from session import SessionError, SessionStore, restore_state  # noqa: E402
+from state import State  # noqa: E402
+
+
+class TestSession(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_round_trip_preserves_messages_but_resets_process_local_safety(self):
+        store = SessionStore.create(self.tmpdir, "model-a", "first task")
+        st = State(
+            rev=2,
+            ok_rev=2,
+            changed=True,
+            files={"a.py"},
+            in_tok=10,
+            out_tok=4,
+            session_id=store.session_id,
+        )
+        tool_group = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "result"},
+        ]
+        store.record_group(tool_group, st)
+        store.record_task("follow-up task")
+        store.record_group([{"role": "assistant", "content": "done"}], st)
+
+        reopened = SessionStore.open(self.tmpdir, store.session_id)
+        loaded = reopened.load("fresh system")
+        restored = restore_state(loaded.state, reopened.session_id)
+
+        self.assertEqual(loaded.ctx.current_task, "follow-up task")
+        self.assertIn("c1", json.dumps(loaded.ctx.history_groups))
+        self.assertEqual(loaded.ctx.groups[-1][0]["content"], "done")
+        self.assertEqual((restored.rev, restored.changed, restored.files), (2, True, {"a.py"}))
+        self.assertEqual(restored.ok_rev, -1)
+        self.assertEqual(restored.errs, 0)
+        self.assertEqual(restored.repetition.count, 0)
+        self.assertFalse(restored.permissions.allow_clean_edits)
+        self.assertEqual(loaded.previous_verified_revision, 2)
+
+    def test_incomplete_final_jsonl_line_is_ignored(self):
+        store = SessionStore.create(self.tmpdir, "model-a", "task")
+        with store.path.open("a", encoding="utf-8") as stream:
+            stream.write('{"type":"group"')
+        loaded = store.load("system")
+        self.assertEqual(loaded.ctx.current_task, "task")
+
+    def test_session_selector_cannot_escape_workspace_store(self):
+        SessionStore.create(self.tmpdir, "model-a", "task")
+        with self.assertRaises(SessionError):
+            SessionStore.open(self.tmpdir, "../outside.jsonl")
+
+
+if __name__ == "__main__":
+    unittest.main()

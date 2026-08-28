@@ -96,6 +96,27 @@ class TestAgentLoop(unittest.TestCase):
         self.assertEqual(len(fake.messages), 2)
         self.assertEqual(fake.messages[1][-1]["role"], "tool")
 
+    def test_session_persistence_callback_receives_complete_logical_groups(self):
+        Path(self.tmpdir, "a.txt").write_text("hello", encoding="utf-8")
+        fake = FakeLLM([
+            tools_message(call("1", "read_file", {"path": "a.txt"})),
+            {"content": "Done."},
+        ])
+        persisted = []
+        ctx = Ctx("system", "task")
+        with contextlib.redirect_stdout(io.StringIO()):
+            final = agent.run_task(
+                ctx,
+                st=State(),
+                model_call=fake,
+                logger=self.logger,
+                persist_group=lambda group, st: persisted.append(group),
+            )
+        self.assertEqual(final, "Done.")
+        self.assertEqual([message["role"] for message in persisted[0]], ["assistant", "tool"])
+        self.assertEqual(persisted[0][1]["tool_call_id"], "1")
+        self.assertEqual(persisted[1], [{"role": "assistant", "content": "Done."}])
+
     def test_reasoning_content_is_preserved_for_deepseek_tool_rounds(self):
         Path(self.tmpdir, "a.txt").write_text("hello", encoding="utf-8")
         first = tools_message(call("1", "read_file", {"path": "a.txt"}))
@@ -146,6 +167,24 @@ class TestAgentLoop(unittest.TestCase):
         self.assertEqual(final, "Done after recheck.")
         self.assertIn("has not been successfully verified", fake.messages[4][-1]["content"])
         self.assertEqual((st.rev, st.ok_rev), (2, 2))
+
+    def test_configured_final_verifier_rejects_a_different_successful_check(self):
+        Path(self.tmpdir, "a.txt").write_text("old", encoding="utf-8")
+        required = f'"{sys.executable}" -c "print(\'required\')"'
+        other = f'"{sys.executable}" -c "print(\'other\')"'
+        st = State(required_verifier=required)
+        fake = FakeLLM([
+            tools_message(call("1", "edit_file", {"path": "a.txt", "old": "old", "new": "new"})),
+            tools_message(call("2", "check_command", {"cmd": other})),
+            {"content": "Done too early."},
+            tools_message(call("3", "check_command", {"cmd": required})),
+            {"content": "Done with required verifier."},
+        ])
+        final, st, _ = self.run_agent(fake, st)
+        self.assertEqual(final, "Done with required verifier.")
+        self.assertIn("did not satisfy", fake.messages[2][-1]["content"])
+        self.assertIn("has not been successfully verified", fake.messages[3][-1]["content"])
+        self.assertEqual(st.ok_rev, st.rev)
 
     def test_bad_tool_argument_json_is_an_observation(self):
         fake = FakeLLM([
