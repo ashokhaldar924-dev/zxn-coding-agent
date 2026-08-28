@@ -5,7 +5,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+import config
 from gitguard import GitGuard
+from guards import RepetitionGuard
 from permissions import PermissionManager
 
 
@@ -22,6 +24,7 @@ class ToolRes:
     rc: int | None = None
     rejected: bool = False
     blocked: bool = False
+    block_kind: str | None = None
 
 
 @dataclass
@@ -37,3 +40,6 @@ class State:
     start: float = field(default_factory=time.time)
     permissions: PermissionManager = field(default_factory=PermissionManager)
     git_guard: GitGuard = field(default_factory=GitGuard)
+    repetition: RepetitionGuard = field(
+        default_factory=lambda: RepetitionGuard(config.MAX_IDENTICAL_CALLS)
+    )

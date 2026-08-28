@@ -122,7 +122,11 @@ def _apply_write(path: Path, old: str, new: str, st: State) -> ToolRes:
     if permission.decision is Decision.DENY:
         if permission.user_rejected:
             return ToolRes(f"User rejected changes to {rel}; file was not modified.", rejected=True)
-        return ToolRes(f"Permission policy blocked changes to {rel}: {permission.reason}", blocked=True)
+        return ToolRes(
+            f"Permission policy blocked changes to {rel}: {permission.reason}",
+            blocked=True,
+            block_kind="permission",
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     # Write exact UTF-8 bytes so Windows newline translation cannot turn an
     # existing CRLF into CRCRLF or make a no-op look like a content change.
@@ -315,7 +319,11 @@ def _command(args: dict, st: State, verify: bool) -> ToolRes:
     if permission.decision is Decision.DENY:
         if permission.user_rejected:
             return ToolRes(f"User rejected command: {cmd}", rejected=True)
-        return ToolRes(f"Permission policy blocked command: {permission.reason}", blocked=True)
+        return ToolRes(
+            f"Permission policy blocked command: {permission.reason}",
+            blocked=True,
+            block_kind="permission",
+        )
     result = _exec(cmd, timeout)
     if verify and result.ok and not result.rejected and result.rc == 0:
         st.ok_rev = st.rev

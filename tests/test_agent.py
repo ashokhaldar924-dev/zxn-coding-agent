@@ -58,12 +58,14 @@ class TestAgentLoop(unittest.TestCase):
             "steps": config.MAX_STEPS,
             "time": config.MAX_TIME,
             "errors": config.MAX_ERRORS,
+            "identical": config.MAX_IDENTICAL_CALLS,
         }
         config.WORKSPACE_DIR = self.tmpdir
         config.REQUIRE_CONFIRMATION = False
         config.MAX_STEPS = 30
         config.MAX_TIME = 600
         config.MAX_ERRORS = 4
+        config.MAX_IDENTICAL_CALLS = 3
         self.logger = NullLog()
 
     def tearDown(self):
@@ -72,6 +74,7 @@ class TestAgentLoop(unittest.TestCase):
         config.MAX_STEPS = self.old["steps"]
         config.MAX_TIME = self.old["time"]
         config.MAX_ERRORS = self.old["errors"]
+        config.MAX_IDENTICAL_CALLS = self.old["identical"]
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def run_agent(self, fake, st=None):
@@ -204,6 +207,24 @@ class TestAgentLoop(unittest.TestCase):
         fake = FakeLLM([KeyboardInterrupt()])
         final, _, _ = self.run_agent(fake)
         self.assertEqual(final, "Stopped by user (Ctrl+C).")
+
+    def test_third_identical_tool_call_is_blocked_as_stagnation(self):
+        Path(self.tmpdir, "a.txt").write_text("hello", encoding="utf-8")
+        same = {"path": "a.txt"}
+        fake = FakeLLM([
+            tools_message(call("1", "read_file", same)),
+            tools_message(call("2", "read_file", same)),
+            tools_message(call("3", "read_file", same)),
+            {"content": "Changed approach."},
+        ])
+        final, st, _ = self.run_agent(fake)
+        self.assertEqual(final, "Changed approach.")
+        self.assertIn("Stagnation guard blocked", fake.messages[3][-1]["content"])
+        self.assertEqual(st.errs, 0)
+        self.assertTrue(any(
+            event["event"] == "tool_block" and event["block_kind"] == "stagnation"
+            for event in self.logger.events
+        ))
 
 
 class TestCLI(unittest.TestCase):

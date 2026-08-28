@@ -219,6 +219,13 @@ class TestTools(unittest.TestCase):
         self.assertTrue(rejected.ok)
         self.assertTrue(rejected.rejected)
 
+    def test_policy_denied_command_is_blocked_not_runtime_error(self):
+        result = self.run_tool("run_command", {"cmd": "git reset --hard"})
+        self.assertTrue(result.ok)
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.block_kind, "permission")
+        self.assertIsNone(result.rc)
+
     def test_timeout_is_runtime_error(self):
         result = self.run_tool(
             "run_command",

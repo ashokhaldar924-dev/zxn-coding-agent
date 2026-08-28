@@ -146,7 +146,18 @@ def run_task(
                 return _stop(logger, "max_time", f"Stopped after {config.MAX_TIME:g} seconds.", st)
 
             try:
-                message, usage = model_call(ctx.build(), tools.TOOL_SCHEMAS)
+                model_messages = ctx.build()
+                if ctx.last_stats.pruned_tool_outputs or ctx.last_stats.dropped_groups:
+                    logger.event(
+                        "context_prune",
+                        step=step,
+                        before_chars=ctx.last_stats.before_chars,
+                        after_chars=ctx.last_stats.after_chars,
+                        pruned_tool_outputs=ctx.last_stats.pruned_tool_outputs,
+                        dropped_groups=ctx.last_stats.dropped_groups,
+                        over_budget=ctx.last_stats.over_budget,
+                    )
+                message, usage = model_call(model_messages, tools.TOOL_SCHEMAS)
             except llm.LLMError as exc:
                 logger.event("fatal_error", error=type(exc).__name__, message=str(exc), step=step)
                 raise
@@ -181,7 +192,23 @@ def run_task(
                             result = ToolRes(f"Invalid tool call: {shape_error}", ok=False)
                         else:
                             args, parse_error = _parse_args(call)
-                            result = parse_error or tools.run_tool(name, args or {}, st)
+                            if parse_error:
+                                result = parse_error
+                            else:
+                                stagnation = (
+                                    st.repetition.check(name, args or {})
+                                    if name in tools.REG
+                                    else None
+                                )
+                                result = (
+                                    ToolRes(
+                                        stagnation,
+                                        blocked=True,
+                                        block_kind="stagnation",
+                                    )
+                                    if stagnation
+                                    else tools.run_tool(name, args or {}, st)
+                                )
                         group.append(
                             {"role": "tool", "tool_call_id": call["id"], "content": result.text}
                         )
@@ -195,13 +222,20 @@ def run_task(
                             rc=result.rc,
                             rejected=result.rejected,
                             blocked=result.blocked,
+                            block_kind=result.block_kind,
                             revision=st.rev,
                             verified_revision=st.ok_rev,
                         )
                         if result.rejected:
                             logger.event("user_rejection", step=step, id=call["id"], name=name)
                         if result.blocked:
-                            logger.event("permission_block", step=step, id=call["id"], name=name)
+                            logger.event(
+                                "tool_block",
+                                step=step,
+                                id=call["id"],
+                                name=name,
+                                block_kind=result.block_kind,
+                            )
                         st.errs = 0 if result.ok else st.errs + 1
                     ctx.add_group(group)
 

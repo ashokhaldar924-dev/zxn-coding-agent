@@ -18,10 +18,16 @@ from log import RunLog  # noqa: E402
 class TestContext(unittest.TestCase):
     def setUp(self):
         self.old_groups = config.MAX_GROUPS
+        self.old_chars = config.MAX_CONTEXT_CHARS
+        self.old_keep = config.CONTEXT_KEEP_FULL_GROUPS
         config.MAX_GROUPS = 2
+        config.MAX_CONTEXT_CHARS = 60_000
+        config.CONTEXT_KEEP_FULL_GROUPS = 1
 
     def tearDown(self):
         config.MAX_GROUPS = self.old_groups
+        config.MAX_CONTEXT_CHARS = self.old_chars
+        config.CONTEXT_KEEP_FULL_GROUPS = self.old_keep
 
     def test_head_is_always_preserved(self):
         ctx = Ctx("system", "original task")
@@ -63,6 +69,59 @@ class TestContext(unittest.TestCase):
         built = ctx.build()
         built[-1]["content"] = "mutated"
         self.assertEqual(ctx.build()[-1]["content"], "answer")
+
+    def test_old_large_tool_output_is_pruned_before_recent_group(self):
+        config.MAX_CONTEXT_CHARS = 700
+        ctx = Ctx("system", "task")
+        ctx.add_group([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "old", "function": {"name": "read_file", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "old", "content": "X" * 2_000},
+        ])
+        ctx.add_group([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "new", "function": {"name": "read_file", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "new", "content": "recent result"},
+        ])
+        messages = ctx.build()
+        text = json.dumps(messages)
+        self.assertIn("older tool output pruned", text)
+        self.assertIn("recent result", text)
+        self.assertEqual(ctx.last_stats.pruned_tool_outputs, 1)
+        self.assertFalse(ctx.last_stats.over_budget)
+
+    def test_oversized_old_group_is_dropped_whole(self):
+        config.MAX_CONTEXT_CHARS = 500
+        ctx = Ctx("system", "task")
+        ctx.add_group([{"role": "assistant", "content": "old-" + "X" * 2_000}])
+        ctx.add_group([{"role": "assistant", "content": "recent"}])
+        messages = ctx.build()
+        text = json.dumps(messages)
+        self.assertNotIn("old-", text)
+        self.assertIn("recent", text)
+        self.assertEqual(ctx.last_stats.dropped_groups, 1)
+
+    def test_latest_group_is_preserved_even_when_it_exceeds_budget(self):
+        config.MAX_CONTEXT_CHARS = 200
+        ctx = Ctx("system", "task")
+        ctx.add_group([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "latest", "function": {"name": "x", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "latest", "content": "LATEST-" + "X" * 1_000},
+        ])
+        messages = ctx.build()
+        self.assertIn("LATEST-", json.dumps(messages))
+        self.assertEqual(ctx.last_stats.pruned_tool_outputs, 0)
+        self.assertTrue(ctx.last_stats.over_budget)
 
 
 class TestRunLog(unittest.TestCase):
