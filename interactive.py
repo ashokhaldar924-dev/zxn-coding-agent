@@ -52,6 +52,7 @@ def expand_file_references(text: str, workspace: str | Path) -> tuple[str, list[
         return text, []
     references = []
     notes = []
+    remaining = config.MAX_FILE_REFERENCE_TOTAL_CHARS
     for match in matches[:MAX_FILE_REFERENCES]:
         raw_path = (match.group(1) or match.group(2) or "").strip()
         if raw_path in references:
@@ -64,8 +65,15 @@ def expand_file_references(text: str, workspace: str | Path) -> tuple[str, list[
                 raise ValueError("binary files are not supported by @file")
             content = data.decode("utf-8", errors="replace")
             original = len(content)
-            if original > config.MAX_FILE_REFERENCE_CHARS:
-                content = content[: config.MAX_FILE_REFERENCE_CHARS]
+            limit = min(config.MAX_FILE_REFERENCE_CHARS, remaining)
+            if limit <= 0:
+                notes.append(
+                    f"[Could not attach @{raw_path}: aggregate @file budget exhausted]"
+                )
+                continue
+            content = content[:limit]
+            remaining -= len(content)
+            if original > limit:
                 content += f"\n[truncated from {original} characters]"
             relative = path.relative_to(Path(workspace).resolve()).as_posix()
             notes.append(f'<referenced_file path="{relative}">\n{content}\n</referenced_file>')
@@ -87,11 +95,19 @@ def shell_observation(cmd: str, result: ToolRes) -> str:
 
 def status_text(st: State, session_path: Path | None, checkpoint_count: int) -> str:
     session = f"{st.session_id} ({session_path})" if session_path else "none"
-    verified = "yes" if st.changed and st.ok_rev == st.rev else "not required" if not st.changed else "no"
+    verified = (
+        "yes"
+        if st.verification_required() and st.ok_rev == st.rev
+        else "no"
+        if st.verification_required()
+        else "not required"
+    )
     return (
         f"session: {session}\n"
+        f"permission mode: {config.PERMISSION_MODE}\n"
         f"revision: {st.rev}; verified current revision: {verified}\n"
-        f"Agent-changed files: {', '.join(sorted(st.files)) if st.files else 'none'}\n"
+        f"tracked changed files: {', '.join(sorted(st.files)) if st.files else 'none'}\n"
+        f"workspace tracking complete: {'yes' if st.workspace_tracking_complete else 'no (partial)'}\n"
         f"active checkpoints: {checkpoint_count}\n"
-        f"tokens: {st.in_tok + st.out_tok}"
+        f"tokens: session {st.in_tok + st.out_tok}; current task {st.task_tokens}"
     )

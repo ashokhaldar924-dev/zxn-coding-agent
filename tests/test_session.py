@@ -6,11 +6,18 @@ import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from session import SessionError, SessionStore, restore_state  # noqa: E402
-from state import State  # noqa: E402
+from checkpoint import CheckpointManager
+from session import (
+    SessionError,
+    SessionStore,
+    reconcile_checkpoint_state,
+    restore_state,
+)
+from state import State
 
 
 class TestSession(unittest.TestCase):
@@ -29,6 +36,8 @@ class TestSession(unittest.TestCase):
             files={"a.py"},
             in_tok=10,
             out_tok=4,
+            task_in_tok=6,
+            task_out_tok=2,
             session_id=store.session_id,
         )
         tool_group = [
@@ -54,6 +63,7 @@ class TestSession(unittest.TestCase):
         self.assertEqual(loaded.ctx.groups[-1][0]["content"], "done")
         self.assertEqual((restored.rev, restored.changed, restored.files), (2, True, {"a.py"}))
         self.assertEqual(restored.ok_rev, -1)
+        self.assertEqual(restored.task_tokens, 8)
         self.assertEqual(restored.errs, 0)
         self.assertEqual(restored.repetition.count, 0)
         self.assertFalse(restored.permissions.allow_clean_edits)
@@ -70,6 +80,23 @@ class TestSession(unittest.TestCase):
         SessionStore.create(self.tmpdir, "model-a", "task")
         with self.assertRaises(SessionError):
             SessionStore.open(self.tmpdir, "../outside.jsonl")
+
+    def test_resume_reconciles_checkpoint_newer_than_durable_state(self):
+        manager = CheckpointManager(self.tmpdir, "session-test")
+        target = Path(self.tmpdir, "a.py")
+        target.write_bytes(b"old")
+        prepared = manager.prepare("a.py", b"old", b"new", revision_before=0)
+        target.write_bytes(b"new")
+        manager.commit(prepared, revision_after=1)
+        st = State(session_id="session-test")
+
+        reconciled = reconcile_checkpoint_state(st, manager.active())
+
+        self.assertEqual(reconciled, ["a.py"])
+        self.assertEqual(st.rev, 1)
+        self.assertTrue(st.changed)
+        self.assertEqual(st.files, {"a.py"})
+        self.assertEqual(st.ok_rev, -1)
 
 
 if __name__ == "__main__":

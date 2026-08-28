@@ -41,6 +41,8 @@ def _state_data(st: State) -> dict[str, Any]:
         "files": sorted(st.files),
         "in_tok": st.in_tok,
         "out_tok": st.out_tok,
+        "task_in_tok": st.task_in_tok,
+        "task_out_tok": st.task_out_tok,
         "last_check_cmd": st.last_check_cmd,
         "last_check_rc": st.last_check_rc,
         "last_check_rev": st.last_check_rev,
@@ -60,6 +62,8 @@ def restore_state(data: dict[str, Any], session_id: str) -> State:
         files={str(path) for path in data.get("files", []) if isinstance(path, str)},
         in_tok=max(0, int(data.get("in_tok", 0))),
         out_tok=max(0, int(data.get("out_tok", 0))),
+        task_in_tok=max(0, int(data.get("task_in_tok", 0))),
+        task_out_tok=max(0, int(data.get("task_out_tok", 0))),
         last_check_cmd=(
             str(data["last_check_cmd"])
             if data.get("last_check_cmd") is not None
@@ -78,6 +82,31 @@ def restore_state(data: dict[str, Any], session_id: str) -> State:
         external_change_possible=bool(data.get("external_change_possible", False)),
         session_id=session_id,
     )
+
+
+def reconcile_checkpoint_state(
+    st: State,
+    active_checkpoints: list[dict[str, Any]],
+) -> list[str]:
+    """Recover file effects committed after the last durable session state."""
+
+    missing: list[tuple[int, str]] = []
+    for record in active_checkpoints:
+        try:
+            revision_after = int(record["revision_after"])
+            path = str(record["path"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SessionError("Active checkpoint contains invalid recovery state.") from exc
+        if revision_after > st.rev:
+            missing.append((revision_after, path))
+    if not missing:
+        return []
+
+    st.rev = max(revision for revision, _ in missing)
+    st.changed = True
+    st.invalidate_verification()
+    st.files.update(path for _, path in missing)
+    return sorted({path for _, path in missing})
 
 
 class SessionStore:

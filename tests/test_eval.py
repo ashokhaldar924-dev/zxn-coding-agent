@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import json
 import os
-from pathlib import Path
 import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from evals.cases import CASES  # noqa: E402
-from evals.run_eval import _hash_tests, _run_verifier, materialize  # noqa: E402
+from evals.cases import CASES
+from evals.run_eval import (
+    _hash_tests,
+    _run_verifier,
+    _trajectory_metrics,
+    materialize,
+)
 
 
 class TestEvalFixtures(unittest.TestCase):
@@ -29,6 +35,56 @@ class TestEvalFixtures(unittest.TestCase):
             hashes = _hash_tests(workspace)
             self.assertTrue(hashes)
             self.assertTrue((workspace / ".agent-verifier").is_file())
+
+    def test_trajectory_metrics_capture_first_check_recovery_cost_and_time(self):
+        workspace = Path(self.tmpdir, "metrics")
+        log_dir = workspace / ".agent"
+        log_dir.mkdir(parents=True)
+        events = [
+            {"event": "model_response", "step": 1},
+            {"event": "tool_call", "step": 1, "name": "check_command"},
+            {
+                "event": "tool_result",
+                "step": 1,
+                "name": "check_command",
+                "rc": 1,
+                "output_ref": "cmd-example.txt",
+            },
+            {"event": "tool_call", "step": 2, "name": "edit_file"},
+            {
+                "event": "tool_result",
+                "step": 2,
+                "name": "edit_file",
+                "changed_files": ["a.py"],
+            },
+            {"event": "tool_call", "step": 3, "name": "check_command"},
+            {"event": "tool_result", "step": 3, "name": "check_command", "rc": 0},
+            {
+                "event": "final",
+                "step": 4,
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "elapsed_seconds": 2.5,
+                "revision": 1,
+                "verified_revision": 1,
+                "files": ["a.py"],
+            },
+        ]
+        (log_dir / "run-test.jsonl").write_text(
+            "\n".join(json.dumps(event) for event in events) + "\n",
+            encoding="utf-8",
+        )
+
+        metrics = _trajectory_metrics(workspace)
+
+        self.assertEqual(metrics["verification_attempts"], 2)
+        self.assertEqual(metrics["first_check_rc"], 1)
+        self.assertFalse(metrics["first_check_passed"])
+        self.assertEqual(metrics["first_successful_check_step"], 3)
+        self.assertEqual(metrics["workspace_change_events"], 1)
+        self.assertEqual(metrics["saved_command_outputs"], 1)
+        self.assertEqual(metrics["tokens"], 150)
+        self.assertEqual(metrics["task_elapsed_seconds"], 2.5)
 
 
 if __name__ == "__main__":

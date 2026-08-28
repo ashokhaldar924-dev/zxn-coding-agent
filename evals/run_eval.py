@@ -63,7 +63,14 @@ def _run_verifier(workspace: Path) -> subprocess.CompletedProcess[str]:
 def _trajectory_metrics(workspace: Path) -> dict:
     logs = sorted((workspace / ".agent").glob("run-*.jsonl"))
     if not logs:
-        return {"trajectory": None, "tool_calls": 0, "steps": 0, "tokens": 0}
+        return {
+            "trajectory": None,
+            "tool_calls": 0,
+            "steps": 0,
+            "tokens": 0,
+            "verification_attempts": 0,
+            "first_check_passed": False,
+        }
     path = logs[-1]
     events = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -79,6 +86,13 @@ def _trajectory_metrics(workspace: Path) -> dict:
         for event in events
         if event.get("event") == "tool_result" and event.get("name") == "check_command"
     ]
+    first_successful = next((event for event in checks if event.get("rc") == 0), None)
+    usage_tokens = sum(
+        int((event.get("usage") or {}).get("input_tokens", (event.get("usage") or {}).get("prompt_tokens", 0)) or 0)
+        + int((event.get("usage") or {}).get("output_tokens", (event.get("usage") or {}).get("completion_tokens", 0)) or 0)
+        for event in events
+        if event.get("event") == "model_response"
+    )
     return {
         "trajectory": str(path.relative_to(workspace)),
         "tool_calls": sum(event.get("event") == "tool_call" for event in events),
@@ -87,15 +101,32 @@ def _trajectory_metrics(workspace: Path) -> dict:
             for event in events
         ),
         "failed_checks": sum(event.get("rc") not in {None, 0} for event in checks),
+        "verification_attempts": len(checks),
+        "first_check_rc": checks[0].get("rc") if checks else None,
+        "first_check_passed": bool(checks and checks[0].get("rc") == 0),
+        "first_successful_check_step": (
+            first_successful.get("step") if first_successful is not None else None
+        ),
+        "workspace_change_events": sum(
+            event.get("event") == "tool_result" and bool(event.get("changed_files"))
+            for event in events
+        ),
+        "saved_command_outputs": sum(
+            event.get("event") == "tool_result" and bool(event.get("output_ref"))
+            for event in events
+        ),
         "steps": max(
             [int(event.get("step", 0)) for event in events if event.get("event") == "model_response"],
             default=0,
         ),
-        "tokens": int(final.get("input_tokens", 0)) + int(final.get("output_tokens", 0)),
+        "tokens": usage_tokens or (
+            int(final.get("input_tokens", 0)) + int(final.get("output_tokens", 0))
+        ),
         "changed_files": final.get("files", []),
         "final_revision": final.get("revision"),
         "verified_revision": final.get("verified_revision"),
         "has_final": bool(final),
+        "task_elapsed_seconds": final.get("elapsed_seconds"),
     }
 
 
@@ -192,7 +223,28 @@ def main() -> int:
                 ),
                 "total_tokens": sum(result.get("tokens", 0) for result in results),
                 "tool_calls": sum(result.get("tool_calls", 0) for result in results),
+                "verification_attempts": sum(
+                    result.get("verification_attempts", 0) for result in results
+                ),
+                "saved_command_outputs": sum(
+                    result.get("saved_command_outputs", 0) for result in results
+                ),
+                "first_check_passes": sum(
+                    result.get("first_check_passed", False) for result in results
+                ),
                 "failure_recoveries": sum(result.get("failure_recovery", False) for result in results),
+                "total_duration_seconds": round(
+                    sum(float(result.get("duration_seconds", 0)) for result in results), 3
+                ),
+                "average_duration_seconds": (
+                    round(
+                        sum(float(result.get("duration_seconds", 0)) for result in results)
+                        / len(results),
+                        3,
+                    )
+                    if not args.dry_run
+                    else None
+                ),
             },
         }
         output = args.output

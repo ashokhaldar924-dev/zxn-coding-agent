@@ -9,9 +9,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config  # noqa: E402
-from ctx import Ctx  # noqa: E402
-from log import RunLog  # noqa: E402
+import config
+from ctx import Ctx
+from log import RunLog
 
 
 class TestContext(unittest.TestCase):
@@ -81,7 +81,11 @@ class TestContext(unittest.TestCase):
                 "content": "",
                 "tool_calls": [{"id": "old", "function": {"name": "read_file", "arguments": "{}"}}],
             },
-            {"role": "tool", "tool_call_id": "old", "content": "X" * 2_000},
+            {
+                "role": "tool",
+                "tool_call_id": "old",
+                "content": "X" * 2_000 + " cmd-012345abcdef.txt",
+            },
         ])
         ctx.add_group([
             {
@@ -94,6 +98,7 @@ class TestContext(unittest.TestCase):
         messages = ctx.build()
         text = json.dumps(messages)
         self.assertIn("older tool output pruned", text)
+        self.assertIn("cmd-012345abcdef.txt", text)
         self.assertIn("recent result", text)
         self.assertEqual(ctx.last_stats.pruned_tool_outputs, 1)
         self.assertFalse(ctx.last_stats.over_budget)

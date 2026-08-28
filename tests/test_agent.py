@@ -4,21 +4,21 @@ import contextlib
 import io
 import json
 import os
-from pathlib import Path
 import shutil
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import agent  # noqa: E402
-import config  # noqa: E402
-from ctx import Ctx  # noqa: E402
-from log import NullLog  # noqa: E402
-from state import State  # noqa: E402
+import agent
+import config
+from ctx import Ctx
+from log import NullLog
+from state import State
 
 
 def call(call_id: str, name: str, args) -> dict:
@@ -46,6 +46,10 @@ class FakeLLM:
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
             raise response
+        if callable(response):
+            response = response()
+        if isinstance(response, tuple):
+            return response
         return response, {}
 
 
@@ -55,26 +59,32 @@ class TestAgentLoop(unittest.TestCase):
         self.old = {
             "workspace": config.WORKSPACE_DIR,
             "confirm": config.REQUIRE_CONFIRMATION,
+            "permission_mode": config.PERMISSION_MODE,
             "steps": config.MAX_STEPS,
             "time": config.MAX_TIME,
             "errors": config.MAX_ERRORS,
             "identical": config.MAX_IDENTICAL_CALLS,
+            "task_tokens": config.MAX_TASK_TOKENS,
         }
         config.WORKSPACE_DIR = self.tmpdir
         config.REQUIRE_CONFIRMATION = False
+        config.PERMISSION_MODE = "balanced"
         config.MAX_STEPS = 30
         config.MAX_TIME = 600
         config.MAX_ERRORS = 4
         config.MAX_IDENTICAL_CALLS = 3
+        config.MAX_TASK_TOKENS = 0
         self.logger = NullLog()
 
     def tearDown(self):
         config.WORKSPACE_DIR = self.old["workspace"]
         config.REQUIRE_CONFIRMATION = self.old["confirm"]
+        config.PERMISSION_MODE = self.old["permission_mode"]
         config.MAX_STEPS = self.old["steps"]
         config.MAX_TIME = self.old["time"]
         config.MAX_ERRORS = self.old["errors"]
         config.MAX_IDENTICAL_CALLS = self.old["identical"]
+        config.MAX_TASK_TOKENS = self.old["task_tokens"]
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def run_agent(self, fake, st=None):
@@ -168,6 +178,42 @@ class TestAgentLoop(unittest.TestCase):
         self.assertIn("has not been successfully verified", fake.messages[4][-1]["content"])
         self.assertEqual((st.rev, st.ok_rev), (2, 2))
 
+    def test_failed_verification_then_fix_reverify_and_finish(self):
+        path = Path(self.tmpdir, "answer.txt")
+        path.write_text("old", encoding="utf-8")
+        verifier = (
+            f'"{sys.executable}" -c "from pathlib import Path; import sys; '
+            "sys.exit(Path('answer.txt').read_text(encoding='utf-8') != 'right')\""
+        )
+        fake = FakeLLM([
+            tools_message(
+                call("1", "edit_file", {"path": "answer.txt", "old": "old", "new": "wrong"})
+            ),
+            tools_message(call("2", "check_command", {"cmd": verifier})),
+            tools_message(
+                call(
+                    "3",
+                    "edit_file",
+                    {"path": "answer.txt", "old": "wrong", "new": "right"},
+                )
+            ),
+            tools_message(call("4", "check_command", {"cmd": verifier})),
+            {"content": "Fixed and verified."},
+        ])
+
+        final, st, _ = self.run_agent(fake)
+
+        self.assertEqual(final, "Fixed and verified.")
+        self.assertEqual(path.read_text(encoding="utf-8"), "right")
+        self.assertEqual((st.rev, st.ok_rev), (2, 2))
+        checks = [
+            event
+            for event in self.logger.events
+            if event.get("event") == "tool_result" and event.get("name") == "check_command"
+        ]
+        self.assertEqual([event["rc"] for event in checks], [1, 0])
+        self.assertIn("elapsed_seconds", self.logger.events[-1])
+
     def test_configured_final_verifier_rejects_a_different_successful_check(self):
         Path(self.tmpdir, "a.txt").write_text("old", encoding="utf-8")
         required = f'"{sys.executable}" -c "print(\'required\')"'
@@ -186,6 +232,69 @@ class TestAgentLoop(unittest.TestCase):
         self.assertIn("has not been successfully verified", fake.messages[3][-1]["content"])
         self.assertEqual(st.ok_rev, st.rev)
 
+    def test_run_command_invalidates_verification_and_final_gate_requires_recheck(self):
+        path = Path(self.tmpdir, "a.txt")
+        path.write_text("old", encoding="utf-8")
+        check = f'"{sys.executable}" -c "print(\'ok\')"'
+        shell_write = (
+            f'"{sys.executable}" -c "from pathlib import Path; '
+            "Path('a.txt').write_text('shell', encoding='utf-8')\""
+        )
+        fake = FakeLLM([
+            tools_message(call("1", "edit_file", {"path": "a.txt", "old": "old", "new": "agent"})),
+            tools_message(call("2", "check_command", {"cmd": check})),
+            tools_message(call("3", "run_command", {"cmd": shell_write})),
+            {"content": "Done too early."},
+            tools_message(call("4", "check_command", {"cmd": check})),
+            {"content": "Done after recheck."},
+        ])
+
+        final, st, _ = self.run_agent(fake)
+
+        self.assertEqual(final, "Done after recheck.")
+        self.assertEqual(path.read_text(encoding="utf-8"), "shell")
+        self.assertTrue(st.external_change_possible)
+        self.assertEqual(st.rev, 2)
+        self.assertEqual(st.files, {"a.txt"})
+        self.assertEqual(st.ok_rev, st.rev)
+        self.assertIn("has not been successfully verified", fake.messages[4][-1]["content"])
+        shell_result = next(
+            event
+            for event in self.logger.events
+            if event.get("event") == "tool_result" and event.get("name") == "run_command"
+        )
+        self.assertEqual(shell_result["changed_files"], ["a.txt"])
+        self.assertTrue(shell_result["workspace_scan_complete"])
+
+    def test_external_change_after_verifier_is_detected_before_final(self):
+        path = Path(self.tmpdir, "a.txt")
+        path.write_text("old", encoding="utf-8")
+        check = {"cmd": f'"{sys.executable}" -c "print(1)"'}
+
+        def external_change_then_final():
+            path.write_text("changed outside", encoding="utf-8")
+            return {"content": "Done against stale verification."}
+
+        fake = FakeLLM([
+            tools_message(call("1", "edit_file", {"path": "a.txt", "old": "old", "new": "new"})),
+            tools_message(call("2", "check_command", check)),
+            external_change_then_final,
+            tools_message(call("3", "check_command", check)),
+            {"content": "Done after verifying the current workspace."},
+        ])
+
+        final, st, _ = self.run_agent(fake)
+
+        self.assertEqual(final, "Done after verifying the current workspace.")
+        self.assertEqual(path.read_text(encoding="utf-8"), "changed outside")
+        self.assertEqual((st.rev, st.ok_rev), (2, 2))
+        self.assertIn("changed after the last successful verification", fake.messages[3][-1]["content"])
+        self.assertTrue(any(
+            event.get("event") == "workspace_reconcile"
+            and event.get("changed_files") == ["a.txt"]
+            for event in self.logger.events
+        ))
+
     def test_bad_tool_argument_json_is_an_observation(self):
         fake = FakeLLM([
             tools_message(call("1", "read_file", "{bad json")),
@@ -199,14 +308,15 @@ class TestAgentLoop(unittest.TestCase):
     def test_user_rejections_are_observations_not_errors(self):
         Path(self.tmpdir, "a.txt").write_text("old", encoding="utf-8")
         config.REQUIRE_CONFIRMATION = True
+        config.PERMISSION_MODE = "manual"
         fake = FakeLLM([
             tools_message(
                 call("1", "edit_file", {"path": "a.txt", "old": "old", "new": "new"}),
-                call("2", "run_command", {"cmd": "echo no"}),
+                call("2", "run_command", {"cmd": "custom-tool action"}),
             ),
             {"content": "Stopped safely."},
         ])
-        with mock.patch("builtins.input", return_value="n"):
+        with mock.patch("builtins.input", side_effect=["3", "3"]):
             final, st, _ = self.run_agent(fake)
         self.assertEqual(final, "Stopped safely.")
         self.assertEqual(st.errs, 0)
@@ -224,7 +334,7 @@ class TestAgentLoop(unittest.TestCase):
         self.assertIn("4 consecutive runtime/tool errors", final)
         self.assertEqual(st.errs, 4)
 
-    def test_max_steps_and_wall_time_are_runtime_termination_conditions(self):
+    def test_step_time_and_task_token_budgets_are_runtime_termination_conditions(self):
         config.MAX_STEPS = 1
         fake = FakeLLM([tools_message(call("1", "read_file", {"path": "missing"}))])
         final, _, _ = self.run_agent(fake)
@@ -241,6 +351,34 @@ class TestAgentLoop(unittest.TestCase):
         final, _, _ = self.run_agent(should_not_call, st)
         self.assertIn("Stopped after 1 seconds", final)
         self.assertFalse(called)
+
+        config.MAX_STEPS = 30
+        config.MAX_TIME = 600
+        config.MAX_TASK_TOKENS = 10
+        Path(self.tmpdir, "budget.txt").write_text("evidence", encoding="utf-8")
+        budget_fake = FakeLLM([
+            (
+                tools_message(call("budget", "read_file", {"path": "budget.txt"})),
+                {"input_tokens": 7, "output_tokens": 4},
+            ),
+            {"content": "must not be requested"},
+        ])
+        final, budget_state, _ = self.run_agent(budget_fake)
+        self.assertIn("task token budget (11/10)", final)
+        self.assertEqual(budget_state.task_tokens, 11)
+        self.assertEqual(len(budget_fake.messages), 1)
+
+        config.MAX_TASK_TOKENS = 20
+        warning_fake = FakeLLM([
+            (
+                tools_message(call("warning", "read_file", {"path": "budget.txt"})),
+                {"input_tokens": 12, "output_tokens": 4},
+            ),
+            {"content": "Finished within budget."},
+        ])
+        final, _, _ = self.run_agent(warning_fake)
+        self.assertEqual(final, "Finished within budget.")
+        self.assertIn("approaching limit", warning_fake.messages[1][0]["content"])
 
     def test_ctrl_c_is_a_controlled_stop(self):
         fake = FakeLLM([KeyboardInterrupt()])

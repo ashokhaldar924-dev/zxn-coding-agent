@@ -139,7 +139,7 @@ class CheckpointManager:
     def _records(self) -> list[dict[str, Any]]:
         prepared: dict[str, dict[str, Any]] = {}
         order: list[str] = []
-        applied: set[str] = set()
+        applied: dict[str, Any] = {}
         restored: set[str] = set()
         for entry in self._entries():
             checkpoint_id = str(entry.get("id", ""))
@@ -147,7 +147,7 @@ class CheckpointManager:
                 prepared[checkpoint_id] = entry
                 order.append(checkpoint_id)
             elif entry.get("type") == "applied":
-                applied.add(checkpoint_id)
+                applied[checkpoint_id] = entry.get("revision_after")
             elif entry.get("type") == "restored":
                 restored.add(checkpoint_id)
 
@@ -161,7 +161,17 @@ class CheckpointManager:
             # A crash after the target write but before the applied marker is
             # recoverable when the on-disk hash proves that the edit landed.
             if checkpoint_id in applied or current_hash == record.get("after_hash"):
-                records.append(record)
+                active_record = dict(record)
+                revision_after = applied.get(checkpoint_id)
+                if revision_after is None:
+                    revision_after = int(record.get("revision_before", 0)) + 1
+                try:
+                    active_record["revision_after"] = max(1, int(revision_after))
+                except (TypeError, ValueError) as exc:
+                    raise CheckpointError(
+                        f"checkpoint {checkpoint_id} has an invalid revision"
+                    ) from exc
+                records.append(active_record)
         return records
 
     def active(self) -> list[dict[str, Any]]:

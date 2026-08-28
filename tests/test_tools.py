@@ -3,19 +3,19 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-from pathlib import Path
 import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config  # noqa: E402
-from gitguard import GitGuard  # noqa: E402
-from state import State  # noqa: E402
-import tools  # noqa: E402
+import config
+import tools
+from gitguard import GitGuard
+from state import State
 
 
 class TestTools(unittest.TestCase):
@@ -23,10 +23,12 @@ class TestTools(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         self.old_workspace = config.WORKSPACE_DIR
         self.old_confirm = config.REQUIRE_CONFIRMATION
+        self.old_permission_mode = config.PERMISSION_MODE
         self.old_limit = config.MAX_TOOL_CHARS
         self.old_timeout = config.CMD_TIMEOUT
         config.WORKSPACE_DIR = self.tmpdir
         config.REQUIRE_CONFIRMATION = False
+        config.PERMISSION_MODE = "balanced"
         config.MAX_TOOL_CHARS = 12_000
         config.CMD_TIMEOUT = 2
         self.st = State()
@@ -34,6 +36,7 @@ class TestTools(unittest.TestCase):
     def tearDown(self):
         config.WORKSPACE_DIR = self.old_workspace
         config.REQUIRE_CONFIRMATION = self.old_confirm
+        config.PERMISSION_MODE = self.old_permission_mode
         config.MAX_TOOL_CHARS = self.old_limit
         config.CMD_TIMEOUT = self.old_timeout
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -41,10 +44,21 @@ class TestTools(unittest.TestCase):
     def run_tool(self, name, args):
         return tools.run_tool(name, args, self.st)
 
-    def test_registry_has_exactly_nine_tools(self):
+    def test_registry_has_exactly_ten_tools(self):
         self.assertEqual(
             list(tools.REG),
-            ["read_file", "write_file", "edit_file", "list_dir", "glob_files", "repo_map", "search_text", "run_command", "check_command"],
+            [
+                "read_file",
+                "read_command_output",
+                "write_file",
+                "edit_file",
+                "list_dir",
+                "glob_files",
+                "repo_map",
+                "search_text",
+                "run_command",
+                "check_command",
+            ],
         )
 
     def test_safe_path_and_traversal(self):
@@ -56,7 +70,7 @@ class TestTools(unittest.TestCase):
         self.assertFalse(private.ok)
         self.assertIn("private .agent", private.text)
 
-    def test_read_range_and_200_line_cap(self):
+    def test_read_range_cap_and_unchanged_short_observation(self):
         Path(self.tmpdir, "lines.txt").write_text(
             "\n".join(f"line {i}" for i in range(1, 251)), encoding="utf-8"
         )
@@ -64,6 +78,27 @@ class TestTools(unittest.TestCase):
         self.assertTrue(ranged.ok)
         self.assertIn("lines.txt 11-13 / 250", ranged.text)
         self.assertIn("11 | line 11", ranged.text)
+        repeated = self.run_tool("read_file", {"path": "lines.txt", "start": 11, "end": 13})
+        self.assertIn("unchanged", repeated.text)
+        self.assertNotIn("11 | line 11", repeated.text)
+        for step in range(1, config.MAX_GROUPS + 1):
+            self.st.step = step
+            still_recent = self.run_tool(
+                "read_file", {"path": "lines.txt", "start": 11, "end": 13}
+            )
+            self.assertIn("unchanged", still_recent.text)
+        self.st.step = config.MAX_GROUPS + 1
+        expired = self.run_tool("read_file", {"path": "lines.txt", "start": 11, "end": 13})
+        self.assertIn("11 | line 11", expired.text)
+        self.assertNotIn("unchanged", expired.text)
+        path = Path(self.tmpdir, "lines.txt")
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("line 12", "changed 12"),
+            encoding="utf-8",
+        )
+        refreshed = self.run_tool("read_file", {"path": "lines.txt", "start": 11, "end": 13})
+        self.assertIn("12 | changed 12", refreshed.text)
+        self.assertNotIn("unchanged", refreshed.text)
         capped = self.run_tool("read_file", {"path": "lines.txt", "start": 1, "end": 250})
         self.assertIn("1-200 / 250", capped.text)
         self.assertIn("capped at 200", capped.text)
@@ -82,6 +117,7 @@ class TestTools(unittest.TestCase):
 
     def test_write_diff_preview_and_rejection(self):
         config.REQUIRE_CONFIRMATION = True
+        config.PERMISSION_MODE = "manual"
         stream = io.StringIO()
         with mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(stream):
             result = self.run_tool("write_file", {"path": "blocked.txt", "content": "x\n"})
@@ -93,11 +129,12 @@ class TestTools(unittest.TestCase):
 
     def test_edit_zero_one_multiple_and_empty(self):
         Path(self.tmpdir, "a.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+        Path(self.tmpdir, "multiple.txt").write_text("same same", encoding="utf-8")
         zero = self.run_tool("edit_file", {"path": "a.txt", "old": "missing", "new": "x"})
         empty = self.run_tool("edit_file", {"path": "a.txt", "old": "", "new": "x"})
-        Path(self.tmpdir, "a.txt").write_text("same same", encoding="utf-8")
-        multiple = self.run_tool("edit_file", {"path": "a.txt", "old": "same", "new": "x"})
-        Path(self.tmpdir, "a.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+        multiple = self.run_tool(
+            "edit_file", {"path": "multiple.txt", "old": "same", "new": "x"}
+        )
         with contextlib.redirect_stdout(io.StringIO()):
             one = self.run_tool("edit_file", {"path": "a.txt", "old": "beta", "new": "gamma"})
         self.assertFalse(zero.ok)
@@ -105,6 +142,93 @@ class TestTools(unittest.TestCase):
         self.assertFalse(multiple.ok)
         self.assertTrue(one.ok)
         self.assertEqual(Path(self.tmpdir, "a.txt").read_text(encoding="utf-8"), "alpha\ngamma\n")
+        self.assertEqual(self.st.rev, 1)
+
+    def test_external_edit_is_not_overwritten_until_the_file_is_read_again(self):
+        path = Path(self.tmpdir, "shared.txt")
+        path.write_text("original\n", encoding="utf-8")
+        first_read = self.run_tool("read_file", {"path": "shared.txt"})
+        self.assertTrue(first_read.ok)
+
+        path.write_text("user version\n", encoding="utf-8")
+        blocked = self.run_tool(
+            "edit_file",
+            {"path": "shared.txt", "old": "user version", "new": "agent version"},
+        )
+
+        self.assertTrue(blocked.blocked)
+        self.assertEqual(blocked.block_kind, "external_change")
+        self.assertEqual(path.read_text(encoding="utf-8"), "user version\n")
+        self.assertEqual(self.st.rev, 1)
+        self.assertEqual(self.st.files, {"shared.txt"})
+
+        refreshed = self.run_tool("read_file", {"path": "shared.txt"})
+        self.assertIn("user version", refreshed.text)
+        with contextlib.redirect_stdout(io.StringIO()):
+            updated = self.run_tool(
+                "edit_file",
+                {"path": "shared.txt", "old": "user version", "new": "agent version"},
+            )
+        self.assertTrue(updated.ok)
+        self.assertFalse(updated.blocked)
+        self.assertEqual(path.read_text(encoding="utf-8"), "agent version\n")
+        self.assertEqual(self.st.rev, 2)
+
+        path.unlink()
+        deleted = self.run_tool(
+            "edit_file", {"path": "shared.txt", "old": "agent", "new": "replacement"}
+        )
+        self.assertTrue(deleted.blocked)
+        self.assertEqual(deleted.block_kind, "external_change")
+        self.assertFalse(path.exists())
+        self.assertEqual(self.st.rev, 3)
+
+        resume_path = Path(self.tmpdir, "resume.txt")
+        resume_path.write_text("changed while stopped\n", encoding="utf-8")
+        resumed = State()
+        resumed.initialize_workspace_tracking(
+            self.tmpdir,
+            require_file_observation=True,
+        )
+        before_read = tools.run_tool(
+            "edit_file",
+            {"path": "resume.txt", "old": "changed", "new": "overwritten"},
+            resumed,
+        )
+        self.assertTrue(before_read.blocked)
+        self.assertEqual(resumed.rev, 0)
+        tools.run_tool("read_file", {"path": "resume.txt"}, resumed)
+        with contextlib.redirect_stdout(io.StringIO()):
+            after_read = tools.run_tool(
+                "edit_file",
+                {"path": "resume.txt", "old": "changed", "new": "accepted"},
+                resumed,
+            )
+        self.assertTrue(after_read.ok)
+        self.assertEqual(resume_path.read_text(encoding="utf-8"), "accepted while stopped\n")
+
+    def test_edit_rechecks_exact_bytes_after_permission_before_writing(self):
+        path = Path(self.tmpdir, "race.txt")
+        path.write_text("old\n", encoding="utf-8")
+        original_authorize = self.st.permissions.authorize_edit
+
+        def user_edits_during_approval(relative, *, initially_dirty=False):
+            path.write_text("human edit\n", encoding="utf-8")
+            return original_authorize(relative, initially_dirty=initially_dirty)
+
+        with mock.patch.object(
+            self.st.permissions,
+            "authorize_edit",
+            side_effect=user_edits_during_approval,
+        ), contextlib.redirect_stdout(io.StringIO()):
+            result = self.run_tool(
+                "edit_file", {"path": "race.txt", "old": "old", "new": "agent"}
+            )
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.block_kind, "external_change")
+        self.assertIn("after the proposed diff was prepared", result.text)
+        self.assertEqual(path.read_text(encoding="utf-8"), "human edit\n")
         self.assertEqual(self.st.rev, 1)
 
     def test_edit_preserves_crlf_and_noop_ignores_newline_style(self):
@@ -126,6 +250,7 @@ class TestTools(unittest.TestCase):
     def test_edit_rejection_does_not_change_revision(self):
         Path(self.tmpdir, "a.txt").write_text("old", encoding="utf-8")
         config.REQUIRE_CONFIRMATION = True
+        config.PERMISSION_MODE = "manual"
         with mock.patch("builtins.input", return_value="no"), contextlib.redirect_stdout(io.StringIO()):
             result = self.run_tool("edit_file", {"path": "a.txt", "old": "old", "new": "new"})
         self.assertTrue(result.rejected)
@@ -226,6 +351,26 @@ class TestTools(unittest.TestCase):
         self.assertIn("L5 async def run(self, item)", result.text)
         self.assertIn("could not be parsed", result.text)
 
+    def test_repo_map_does_not_follow_file_symlinks_outside_workspace(self):
+        outside_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside_dir, True)
+        outside = Path(outside_dir, "secret.py")
+        outside.write_text("def outside_secret():\n    pass\n", encoding="utf-8")
+        link = Path(self.tmpdir, "link.py")
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            # Windows may deny symlink creation. Feeding the resolved outside
+            # candidate exercises the same per-candidate boundary check.
+            with mock.patch.object(tools, "_search_files", return_value=iter([outside])):
+                result = self.run_tool("repo_map", {"path": "."})
+        else:
+            result = self.run_tool("repo_map", {"path": "."})
+
+        self.assertTrue(result.ok)
+        self.assertNotIn("outside_secret", result.text)
+        self.assertNotIn("link.py", result.text)
+
     def test_run_success_nonzero_and_rejection(self):
         success = self.run_tool("run_command", {"cmd": f'"{sys.executable}" -c "print(123)"'})
         nonzero = self.run_tool("run_command", {"cmd": f'"{sys.executable}" -c "raise SystemExit(7)"'})
@@ -236,7 +381,7 @@ class TestTools(unittest.TestCase):
         self.assertEqual(nonzero.rc, 7)
         config.REQUIRE_CONFIRMATION = True
         with mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(io.StringIO()):
-            rejected = self.run_tool("run_command", {"cmd": "echo no"})
+            rejected = self.run_tool("run_command", {"cmd": "custom-tool action"})
         self.assertTrue(rejected.ok)
         self.assertTrue(rejected.rejected)
 
@@ -256,15 +401,61 @@ class TestTools(unittest.TestCase):
         self.assertIsNone(result.rc)
         self.assertIn("timed out", result.text)
 
-    def test_head_tail_truncation(self):
-        config.MAX_TOOL_CHARS = 120
+    def test_long_command_output_is_saved_and_can_be_read_by_range(self):
+        config.MAX_TOOL_CHARS = 180
         result = self.run_tool(
             "run_command",
-            {"cmd": f'"{sys.executable}" -c "print(\'A\'*100); print(\'TAIL\')"'},
+            {"cmd": f'"{sys.executable}" -c "print(\'A\'*300); print(\'TAIL\')"'},
         )
         self.assertIn("output truncated", result.text)
         self.assertIn("TAIL", result.text)
-        self.assertLessEqual(len(result.text), 120)
+        self.assertLessEqual(len(result.text), 180)
+        self.assertIsNotNone(result.output_ref)
+        saved = Path(
+            self.tmpdir,
+            ".agent",
+            "outputs",
+            "runtime",
+            result.output_ref,
+        )
+        self.assertTrue(saved.is_file())
+        self.assertIn("A" * 300, saved.read_text(encoding="utf-8"))
+
+        reread = self.run_tool(
+            "read_command_output",
+            {"output_id": result.output_ref, "offset": 0, "limit": 120},
+        )
+        self.assertTrue(reread.ok)
+        self.assertIn(result.output_ref, reread.text)
+        self.assertIn("exit code: 0", reread.text)
+
+        old_key = os.environ.get("AGENT_API_KEY")
+        os.environ["AGENT_API_KEY"] = "command-output-test-secret"
+        try:
+            config.MAX_TOOL_CHARS = 80
+            secret_result = self.run_tool(
+                "run_command",
+                {
+                    "cmd": f'"{sys.executable}" -c "print(\'command-output-test-secret\' * 20)"'
+                },
+            )
+            secret_path = Path(
+                self.tmpdir,
+                ".agent",
+                "outputs",
+                "runtime",
+                secret_result.output_ref,
+            )
+            self.assertNotIn("command-output-test-secret", secret_result.text)
+            self.assertNotIn(
+                "command-output-test-secret",
+                secret_path.read_text(encoding="utf-8"),
+            )
+        finally:
+            if old_key is None:
+                os.environ.pop("AGENT_API_KEY", None)
+            else:
+                os.environ["AGENT_API_KEY"] = old_key
 
     def test_check_updates_only_on_success(self):
         self.st.rev = 3
@@ -277,9 +468,48 @@ class TestTools(unittest.TestCase):
         config.REQUIRE_CONFIRMATION = True
         self.st.rev = 4
         with mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(io.StringIO()):
-            rejected = self.run_tool("check_command", {"cmd": "echo no"})
+            rejected = self.run_tool("check_command", {"cmd": "custom-tool check"})
         self.assertTrue(rejected.rejected)
         self.assertEqual(self.st.ok_rev, 3)
+
+    def test_check_that_changes_workspace_requires_a_stable_rerun(self):
+        command = (
+            f'"{sys.executable}" -c "from pathlib import Path; '
+            "Path('generated.txt').write_text('stable', encoding='utf-8')\""
+        )
+
+        first = self.run_tool("check_command", {"cmd": command})
+
+        self.assertEqual(first.rc, 0)
+        self.assertEqual(self.st.rev, 1)
+        self.assertEqual(self.st.ok_rev, -1)
+        self.assertEqual(first.changed_files, ["generated.txt"])
+        self.assertIn("did not verify the resulting revision", first.text)
+
+        second = self.run_tool("check_command", {"cmd": command})
+        self.assertEqual(second.rc, 0)
+        self.assertEqual(self.st.rev, 1)
+        self.assertEqual(self.st.ok_rev, 1)
+
+    def test_check_can_verify_while_an_ignored_artifact_changes(self):
+        Path(self.tmpdir, ".agentignore").write_text(
+            "coverage.xml\n",
+            encoding="utf-8",
+        )
+        command = (
+            f'"{sys.executable}" -c "from pathlib import Path; import time; '
+            "Path('coverage.xml').write_text(str(time.time_ns()), encoding='utf-8')\""
+        )
+
+        first = self.run_tool("check_command", {"cmd": command})
+        second = self.run_tool("check_command", {"cmd": command})
+
+        self.assertEqual(first.rc, 0)
+        self.assertEqual(second.rc, 0)
+        self.assertEqual(first.changed_files, [])
+        self.assertEqual(second.changed_files, [])
+        self.assertTrue(self.st.verification_current())
+        self.assertEqual(self.st.rev, 0)
 
     def test_configured_final_verifier_must_match_and_latest_failure_invalidates(self):
         flag = Path(self.tmpdir, "flag.txt")

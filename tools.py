@@ -5,14 +5,15 @@ from __future__ import annotations
 import ast
 import difflib
 import fnmatch
+import hashlib
 import os
 import re
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
 import config
 import ui
+from command_runtime import CommandRunner, read_saved_output
 from permissions import Decision
 from state import State, ToolRes
 
@@ -60,18 +61,68 @@ def _clip(text: str) -> str:
     return text[:head] + marker + (text[-tail:] if tail else "")
 
 
-def _read_text(path: Path) -> str:
+def _read_text_data(path: Path) -> tuple[str, bytes]:
     if not path.is_file():
         raise FileNotFoundError(f"file not found: {_relative(path)}")
     data = path.read_bytes()
     if b"\x00" in data[:4096]:
         raise ValueError(f"binary file is not supported: {_relative(path)}")
-    return data.decode("utf-8", errors="replace")
+    return data.decode("utf-8", errors="replace"), data
+
+
+def _read_text(path: Path) -> str:
+    return _read_text_data(path)[0]
+
+
+def _ensure_workspace_tracking(st: State) -> None:
+    root = _root()
+    if st.workspace_tracker.root != root or st.workspace_tracker.last_snapshot is None:
+        snapshot = st.initialize_workspace_tracking(str(root))
+        st.workspace_tracking_complete = (
+            st.workspace_tracking_complete and snapshot.complete
+        )
+
+
+def _observe_file(path: Path, data: bytes | None, st: State) -> str:
+    """Accept current content and record a newly discovered outside change."""
+
+    if not st.workspace_tracker.observe(path, data):
+        return ""
+    rel = _relative(path)
+    st.note_workspace_changes([rel])
+    return (
+        f"\n\n[Runtime detected that {rel} changed outside Agent file tools; "
+        f"workspace revision is now {st.rev}.]"
+    )
+
+
+def _edit_conflict(path: Path, data: bytes | None, st: State) -> ToolRes | None:
+    """Block a stale write until the model reads the newly observed content."""
+
+    reason, newly_seen = st.workspace_tracker.check_edit(path, data)
+    if reason is None:
+        return None
+    rel = _relative(path)
+    changed_files: list[str] = []
+    if newly_seen:
+        st.note_workspace_changes([rel])
+        changed_files.append(rel)
+    return ToolRes(
+        f"Refused stale write to {rel}: {reason}. "
+        "Use read_file to observe the current content (or absence) before retrying.",
+        blocked=True,
+        block_kind="external_change",
+        changed_files=changed_files,
+    )
 
 
 def read_file(args: dict, st: State) -> ToolRes:
     path = _resolve_safe_path(args["path"])
-    text = _read_text(path)
+    if not path.is_file():
+        _observe_file(path, None, st)
+        raise FileNotFoundError(f"file not found: {_relative(path)}")
+    text, data = _read_text_data(path)
+    outside_change = _observe_file(path, data, st)
     lines = text.splitlines()
     total = len(lines)
     start = int(args.get("start", 1))
@@ -79,7 +130,17 @@ def read_file(args: dict, st: State) -> ToolRes:
     if start < 1:
         raise ValueError("start must be >= 1")
     if total == 0:
-        return ToolRes(f"{_relative(path)} 0-0 / 0\n\n(empty file)\n\n0 lines above, 0 lines below.")
+        header = f"{_relative(path)} 0-0 / 0"
+        payload = (
+            f"{header}\n\n(empty file)\n\n0 lines above, 0 lines below."
+            f"{outside_change}"
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if st.observe_read(f"{_relative(path)}:0:0", digest):
+            return ToolRes(
+                f"{header}\n\n[unchanged: this exact range is already present in recent context.]"
+            )
+        return ToolRes(payload)
     if total and start > total:
         raise ValueError(f"start {start} is past the end of the file ({total} lines)")
     if requested_end is None:
@@ -96,7 +157,53 @@ def read_file(args: dict, st: State) -> ToolRes:
     footer = f"{max(0, start - 1)} lines above, {max(0, total - end)} lines below."
     if capped:
         footer += f" Requested range capped at {MAX_READ_LINES} lines."
-    return ToolRes(_clip(f"{header}\n\n" + "\n".join(shown) + f"\n\n{footer}"))
+    payload = _clip(
+        f"{header}\n\n" + "\n".join(shown) + f"\n\n{footer}{outside_change}"
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    if st.observe_read(f"{_relative(path)}:{start}:{end}", digest):
+        return ToolRes(
+            f"{header}\n\n"
+            "[unchanged: this exact range is already present in recent context; "
+            "reuse that observation instead of retransmitting it.]\n\n"
+            f"{footer}"
+        )
+    return ToolRes(payload)
+
+
+def read_command_output(args: dict, st: State) -> ToolRes:
+    """Read a bounded character range from one saved full command result."""
+
+    output_id = args["output_id"]
+    content = read_saved_output(config.WORKSPACE_DIR, st.session_id, output_id)
+    offset = int(args.get("offset", 0))
+    requested = int(args.get("limit", min(8_000, config.MAX_TOOL_CHARS)))
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    if requested < 1:
+        raise ValueError("limit must be >= 1")
+    if offset > len(content):
+        raise ValueError(f"offset {offset} is past the end of the output ({len(content)} chars)")
+    limit = min(requested, config.MAX_TOOL_CHARS)
+    requested_end = min(len(content), offset + limit)
+    end = requested_end
+    for _ in range(2):
+        header = f"saved command output {output_id}: chars {offset}-{end} / {len(content)}"
+        footer = (
+            f"\n\nnext offset: {end}; {len(content) - end} chars remain."
+            if end < len(content)
+            else "\n\n(end of saved output)"
+        )
+        overhead = len(header) + 2 + len(footer)
+        end = min(requested_end, offset + max(0, config.MAX_TOOL_CHARS - overhead))
+    header = f"saved command output {output_id}: chars {offset}-{end} / {len(content)}"
+    footer = (
+        f"\n\nnext offset: {end}; {len(content) - end} chars remain."
+        if end < len(content)
+        else "\n\n(end of saved output)"
+    )
+    payload = f"{header}\n\n{content[offset:end]}{footer}"
+    return ToolRes(payload[: config.MAX_TOOL_CHARS])
 
 
 def _diff(path: str, old: str, new: str) -> str:
@@ -112,7 +219,13 @@ def _diff(path: str, old: str, new: str) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def _apply_write(path: Path, old: str, new: str, st: State) -> ToolRes:
+def _apply_write(
+    path: Path,
+    old: str,
+    new: str,
+    expected_data: bytes | None,
+    st: State,
+) -> ToolRes:
     rel = _relative(path)
     if old == new:
         return ToolRes(f"No change: {rel}")
@@ -131,13 +244,26 @@ def _apply_write(path: Path, old: str, new: str, st: State) -> ToolRes:
             blocked=True,
             block_kind="permission",
         )
-    existed = path.exists()
+    current_data = path.read_bytes() if path.is_file() else None
+    if current_data != expected_data:
+        conflict = _edit_conflict(path, current_data, st)
+        if conflict is not None:
+            conflict.text = (
+                f"{conflict.text} The file changed after the proposed diff was prepared, "
+                "so no bytes were written."
+            )
+            return conflict
+        return ToolRes(
+            f"Refused write to {rel}: filesystem state changed after the diff was prepared.",
+            blocked=True,
+            block_kind="external_change",
+        )
     prepared = None
     new_bytes = new.encode("utf-8")
     if st.checkpoints is not None:
         prepared = st.checkpoints.prepare(
             rel,
-            path.read_bytes() if existed else None,
+            current_data,
             new_bytes,
             st.rev,
         )
@@ -145,15 +271,15 @@ def _apply_write(path: Path, old: str, new: str, st: State) -> ToolRes:
     # Write exact UTF-8 bytes so Windows newline translation cannot turn an
     # existing CRLF into CRCRLF or make a no-op look like a content change.
     path.write_bytes(new_bytes)
-    st.rev += 1
-    st.changed = True
-    st.files.add(rel)
+    st.note_agent_edit(rel)
+    st.workspace_tracker.accept(path, new_bytes)
     checkpoint_text = ""
     if prepared is not None:
         st.checkpoints.commit(prepared, st.rev)
         checkpoint_text = f" Checkpoint: {prepared.checkpoint_id}."
     return ToolRes(
-        f"Updated {rel}; workspace revision is now {st.rev}.{checkpoint_text}"
+        f"Updated {rel}; workspace revision is now {st.rev}.{checkpoint_text}",
+        changed_files=[rel],
     )
 
 
@@ -164,10 +290,16 @@ def write_file(args: dict, st: State) -> ToolRes:
     new = args["content"]
     if not isinstance(new, str):
         raise TypeError("content must be a string")
-    old = _read_text(path) if path.exists() else ""
+    if path.exists():
+        old, old_data = _read_text_data(path)
+    else:
+        old, old_data = "", None
+    conflict = _edit_conflict(path, old_data, st)
+    if conflict is not None:
+        return conflict
     if path.exists() and old.replace("\r\n", "\n").replace("\r", "\n") == new.replace("\r\n", "\n").replace("\r", "\n"):
         return ToolRes(f"No change: {_relative(path)}")
-    return _apply_write(path, old, new, st)
+    return _apply_write(path, old, new, old_data, st)
 
 
 def edit_file(args: dict, st: State) -> ToolRes:
@@ -178,7 +310,15 @@ def edit_file(args: dict, st: State) -> ToolRes:
         raise ValueError("old must be a non-empty string")
     if not isinstance(new_fragment, str):
         raise TypeError("new must be a string")
-    current = _read_text(path)
+    if not path.is_file():
+        conflict = _edit_conflict(path, None, st)
+        if conflict is not None:
+            return conflict
+        raise FileNotFoundError(f"file not found: {_relative(path)}")
+    current, current_data = _read_text_data(path)
+    conflict = _edit_conflict(path, current_data, st)
+    if conflict is not None:
+        return conflict
     count = current.count(old_fragment)
     if count == 0 and "\r\n" in current and "\r" not in old_fragment:
         native_old = old_fragment.replace("\n", "\r\n")
@@ -193,7 +333,7 @@ def edit_file(args: dict, st: State) -> ToolRes:
             f"old text matched {count} times; include more surrounding context so it is unique"
         )
     proposed = current.replace(old_fragment, new_fragment, 1)
-    return _apply_write(path, current, proposed, st)
+    return _apply_write(path, current, proposed, current_data, st)
 
 
 def list_dir(args: dict, st: State) -> ToolRes:
@@ -220,6 +360,16 @@ def _search_files(root: Path):
             yield Path(dirpath) / name
 
 
+def _safe_search_candidate(path: Path) -> Path:
+    """Resolve every recursive candidate and reject boundary/private-data escapes."""
+
+    resolved = path.resolve(strict=False)
+    relative = resolved.relative_to(_root())
+    if relative.parts and relative.parts[0] == ".agent":
+        raise PermissionError("the private .agent runtime directory is not searchable")
+    return resolved
+
+
 def search_text(args: dict, st: State) -> ToolRes:
     query = args["query"]
     if not isinstance(query, str) or not query:
@@ -236,8 +386,7 @@ def search_text(args: dict, st: State) -> ToolRes:
     count = 0
     for path in _search_files(root):
         try:
-            resolved = path.resolve(strict=False)
-            resolved.relative_to(_root())
+            resolved = _safe_search_candidate(path)
             if resolved.stat().st_size > MAX_SEARCH_FILE_BYTES:
                 continue
             data = resolved.read_bytes()
@@ -281,8 +430,7 @@ def glob_files(args: dict, st: State) -> ToolRes:
     count = 0
     for path in _search_files(root):
         try:
-            resolved = path.resolve(strict=False)
-            resolved.relative_to(_root())
+            resolved = _safe_search_candidate(path)
             relative_to_search = resolved.relative_to(root).as_posix() if root.is_dir() else resolved.name
         except (OSError, ValueError):
             continue
@@ -325,7 +473,14 @@ def repo_map(args: dict, st: State) -> ToolRes:
     """Build an on-demand Python symbol overview using the standard AST."""
 
     root = _resolve_safe_path(args.get("path") or ".")
-    python_files = [path for path in _search_files(root) if path.suffix.lower() == ".py"]
+    python_files: list[Path] = []
+    for path in _search_files(root):
+        try:
+            resolved = _safe_search_candidate(path)
+        except (OSError, ValueError):
+            continue
+        if resolved.suffix.lower() == ".py":
+            python_files.append(resolved)
     total_files = len(python_files)
     files = python_files[:MAX_REPO_MAP_FILES]
     lines: list[str] = []
@@ -383,38 +538,73 @@ def _timeout(args: dict) -> float:
     return min(requested, config.CMD_TIMEOUT)
 
 
-def _exec(cmd: str, timeout: float) -> ToolRes:
-    try:
-        proc = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=config.WORKSPACE_DIR,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-            check=False,
+def _exec(cmd: str, timeout: float, session_id: str | None = None) -> ToolRes:
+    execution = CommandRunner(
+        config.WORKSPACE_DIR,
+        session_id,
+        config.MAX_TOOL_CHARS,
+    ).run(cmd, timeout)
+    return ToolRes(
+        execution.text,
+        ok=execution.ok,
+        rc=execution.rc,
+        output_ref=execution.output_ref,
+        output_chars=execution.output_chars,
+    )
+
+
+def _tracked_exec(cmd: str, timeout: float, st: State) -> tuple[ToolRes, bool]:
+    """Execute one command and reconcile observed workspace transitions."""
+
+    before, prior_delta = st.workspace_tracker.before_command(_root())
+    result = _exec(cmd, timeout, st.session_id)
+    _, command_delta = st.workspace_tracker.after_command(before)
+    changed = sorted(set(prior_delta.paths) | set(command_delta.paths))
+    scan_complete = prior_delta.complete and command_delta.complete
+    if changed:
+        st.note_workspace_changes(changed)
+    st.note_shell_attempt(scan_complete)
+    result.changed_files = changed
+    result.workspace_scan_complete = scan_complete
+
+    notes: list[str] = []
+    if prior_delta.paths:
+        notes.append(
+            "Runtime detected workspace changes made outside Agent file tools before "
+            f"this command: {', '.join(prior_delta.paths[:20])}"
         )
-    except subprocess.TimeoutExpired:
-        return ToolRes(f"Command timed out after {timeout:g} seconds.", ok=False)
-    except OSError as exc:
-        return ToolRes(f"Command runtime error: {type(exc).__name__}: {exc}", ok=False)
+    if command_delta.paths:
+        notes.append(
+            "Command changed workspace files: "
+            + ", ".join(command_delta.paths[:20])
+            + (" ..." if len(command_delta.paths) > 20 else "")
+        )
+    if not scan_complete:
+        detail = command_delta.note or prior_delta.note or "snapshot limits were reached"
+        notes.append(f"Workspace change scan was bounded/partial: {detail}")
+    if result.output_ref and notes:
+        notes.append(
+            f"Full command output: {result.output_ref} ({result.output_chars} chars); "
+            "use read_command_output for another range."
+        )
+    if notes:
+        result.text = _clip(result.text + "\n" + "\n".join(notes))
+    return result, bool(command_delta.paths)
 
-    parts = [f"exit code: {proc.returncode}"]
-    if proc.stdout:
-        parts.append(f"stdout:\n{proc.stdout.rstrip()}")
-    if proc.stderr:
-        parts.append(f"stderr:\n{proc.stderr.rstrip()}")
-    return ToolRes(_clip("\n".join(parts)), rc=proc.returncode)
 
-
-def run_user_command(cmd: str, timeout: float | None = None) -> ToolRes:
+def run_user_command(
+    cmd: str,
+    timeout: float | None = None,
+    st: State | None = None,
+) -> ToolRes:
     """Run a command explicitly entered by the human in interactive shell mode."""
 
     if not isinstance(cmd, str) or not cmd.strip():
         return ToolRes("User command must not be empty.", ok=False)
     chosen_timeout = config.CMD_TIMEOUT if timeout is None else min(timeout, config.CMD_TIMEOUT)
-    return _exec(cmd, chosen_timeout)
+    if st is None:
+        return _exec(cmd, chosen_timeout)
+    return _tracked_exec(cmd, chosen_timeout, st)[0]
 
 
 def _command(args: dict, st: State, verify: bool) -> ToolRes:
@@ -423,7 +613,11 @@ def _command(args: dict, st: State, verify: bool) -> ToolRes:
         raise ValueError("cmd must be a non-empty string")
     timeout = _timeout(args)
     print(f"\nRun command:\n{cmd}")
-    permission = st.permissions.authorize_command(cmd)
+    permission = st.permissions.authorize_command(
+        cmd,
+        verification=verify,
+        required_verifier=st.required_verifier if verify else None,
+    )
     if permission.decision is Decision.DENY:
         if permission.user_rejected:
             return ToolRes(f"User rejected command: {cmd}", rejected=True)
@@ -432,20 +626,24 @@ def _command(args: dict, st: State, verify: bool) -> ToolRes:
             blocked=True,
             block_kind="permission",
         )
-    result = _exec(cmd, timeout)
+    result, command_changed_workspace = _tracked_exec(cmd, timeout, st)
     if verify and result.ok and not result.rejected:
-        st.ok_rev = -1
         st.last_check_cmd = cmd
         st.last_check_rc = result.rc
         st.last_check_rev = st.rev
         if result.rc == 0:
-            if st.required_verifier and cmd.strip() != st.required_verifier.strip():
+            if command_changed_workspace:
+                result.text += (
+                    "\nCheck changed workspace files, so it did not verify the resulting "
+                    "revision. Run check_command again after the workspace is stable."
+                )
+            elif st.required_verifier and cmd.strip() != st.required_verifier.strip():
                 result.text += (
                     "\nCheck passed, but it did not satisfy the configured final verifier. "
                     f"Use check_command with exactly: {st.required_verifier}"
                 )
             else:
-                st.ok_rev = st.rev
+                st.mark_verified()
                 result.text += f"\nVerified workspace revision {st.rev}."
     return result
 
@@ -461,6 +659,7 @@ def check_command(args: dict, st: State) -> ToolRes:
 ToolFn = Callable[[dict, State], ToolRes]
 REG: dict[str, ToolFn] = {
     "read_file": read_file,
+    "read_command_output": read_command_output,
     "write_file": write_file,
     "edit_file": edit_file,
     "list_dir": list_dir,
@@ -478,6 +677,7 @@ def run_tool(name: str, args: dict, st: State) -> ToolRes:
     if not isinstance(args, dict):
         return ToolRes("Tool arguments must be a JSON object.", ok=False)
     try:
+        _ensure_workspace_tracking(st)
         return REG[name](args, st)
     except (KeyError, TypeError, ValueError, PermissionError, OSError) as exc:
         return ToolRes(f"Tool error in {name}: {type(exc).__name__}: {exc}", ok=False)
@@ -514,11 +714,16 @@ CMD_PROPS = {
 }
 
 TOOL_SCHEMAS = [
-    _schema("read_file", "Read up to 200 numbered lines from a workspace text file.", {
+    _schema("read_file", "Read up to 200 numbered lines from a workspace text file. An unchanged repeated range returns a compact reuse notice while its earlier content remains in context.", {
         "path": PATH,
         "start": {"type": "integer", "minimum": 1, "description": "First line, 1-based."},
         "end": {"type": "integer", "minimum": 1, "description": "Optional inclusive final line."},
     }, ["path"]),
+    _schema("read_command_output", "Read a bounded character range from a full command output saved by the Runtime after its preview was truncated.", {
+        "output_id": {"type": "string", "description": "Opaque id returned by run_command or check_command."},
+        "offset": {"type": "integer", "minimum": 0, "description": "Zero-based character offset. Defaults to 0."},
+        "limit": {"type": "integer", "minimum": 1, "description": "Maximum characters to read, capped by runtime configuration."},
+    }, ["output_id"]),
     _schema("write_file", "Create or replace a complete text file after showing a diff and requesting approval.", {
         "path": PATH,
         "content": {"type": "string", "description": "Complete new file content."},
@@ -542,7 +747,7 @@ TOOL_SCHEMAS = [
         "regex": {"type": "boolean", "description": "Interpret query as a Python regular expression. Defaults to false."},
     }, ["query"]),
     _schema("run_command", "Run an exploratory shell command locally after user approval.", CMD_PROPS, ["cmd"]),
-    _schema("check_command", "Run a user-approved check; exit code 0 verifies the current workspace revision.", CMD_PROPS, ["cmd"]),
+    _schema("check_command", "Run a focused check or final verifier. If a final verifier is configured, only that exact successful command verifies the current workspace revision.", CMD_PROPS, ["cmd"]),
 ]
 
 # Compatibility name for code that only needs to inspect the registry.

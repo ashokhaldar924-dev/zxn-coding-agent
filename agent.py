@@ -20,7 +20,12 @@ from ctx import Ctx
 from gitguard import GitGuard
 from log import NullLog, RunLog
 from project_context import ProjectContext, load_project_context
-from session import SessionError, SessionStore, restore_state
+from session import (
+    SessionError,
+    SessionStore,
+    reconcile_checkpoint_state,
+    restore_state,
+)
 from state import State, ToolRes
 
 
@@ -30,7 +35,7 @@ def system_prompt(
 ) -> str:
     prompt = f"""You are a coding agent working inside a local project at {config.WORKSPACE_DIR}.
 
-Inspect the repository before changing code. Use read_file, list_dir, glob_files, search_text, and the Python repo_map when useful to gather evidence instead of guessing. For small edits to existing files, prefer edit_file over whole-file write_file. Writes and commands may require user approval; if rejected or blocked, adjust rather than repeating blindly. Commands already start in the workspace on platform {sys.platform}; do not prepend cd, and use commands available on that platform. Never inspect or modify the private .agent trajectory, session, or checkpoint data while solving the task. Use run_command for exploration and check_command when validating the current code revision. If a command fails, inspect its output and continue fixing when appropriate. Do not claim success without evidence. When finished, briefly state what changed, which files changed, and how it was verified."""
+Inspect the repository before changing code. Use repo_map, search_text, glob_files, and targeted read_file ranges to gather evidence instead of guessing or repeatedly rereading unchanged whole files. For small edits to existing files, prefer edit_file over whole-file write_file. Work in small verified increments: after a change, run the smallest relevant tests first; reserve the full suite for meaningful phase boundaries and the final check. Tests should cover core behavior and important boundaries without duplicating equivalent cases. Tests you create are supporting evidence and never replace a user/project-configured final verifier. When creating a new project inside a workspace that already contains unrelated work, keep its code, tests, and documentation in a clear dedicated subdirectory instead of overwriting unrelated root files. Writes and commands may require user approval; if rejected or blocked, adjust rather than repeating blindly. Commands already start in the workspace on platform {sys.platform}; do not prepend cd, and use commands available on that platform. If command output is truncated, inspect its saved output with read_command_output instead of rerunning solely to recover omitted text. Never inspect or modify other private .agent trajectory, session, or checkpoint data while solving the task. Use run_command for exploration and check_command when validating the current code revision. Do not ask about routine implementation details that can be decided from repository evidence. If a missing choice would materially change public behavior, architecture, cost, or high-impact external state, stop and present two or three concise options with a recommendation. If a command fails, inspect the failing output and nearby code before broadening the search. Do not claim success without evidence. When finished, briefly state what changed, which files changed, and how it was verified."""
     if initial_dirty:
         prompt += (
             "\n\nThese files already had user changes before the run: "
@@ -121,11 +126,22 @@ def _add_usage(st: State, usage: dict) -> None:
     out_tok = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
     st.in_tok += in_tok
     st.out_tok += out_tok
+    st.task_in_tok += in_tok
+    st.task_out_tok += out_tok
     print(f"[tokens] in={in_tok} out={out_tok} total={in_tok + out_tok}")
 
 
 def _stop(logger, kind: str, text: str, st: State) -> str:
-    logger.event(kind, message=text, step=st.step, revision=st.rev, verified_revision=st.ok_rev)
+    logger.event(
+        kind,
+        message=text,
+        step=st.step,
+        revision=st.rev,
+        verified_revision=st.ok_rev,
+        input_tokens=st.in_tok,
+        output_tokens=st.out_tok,
+        task_tokens=st.task_tokens,
+    )
     ui.warning(text)
     return text
 
@@ -158,12 +174,24 @@ def run_task(
     try:
         for step in range(1, config.MAX_STEPS + 1):
             st.step = step
+            if config.MAX_TASK_TOKENS > 0 and st.task_tokens >= config.MAX_TASK_TOKENS:
+                return _stop(
+                    logger,
+                    "max_task_tokens",
+                    f"Stopped after reaching the task token budget "
+                    f"({st.task_tokens}/{config.MAX_TASK_TOKENS}). "
+                    "The session remains resumable; increase AGENT_MAX_TASK_TOKENS to continue.",
+                    st,
+                )
             if time.time() - st.start >= config.MAX_TIME:
                 return _stop(logger, "max_time", f"Stopped after {config.MAX_TIME:g} seconds.", st)
 
             try:
                 model_messages = ctx.build(st.runtime_context())
                 if ctx.last_stats.pruned_tool_outputs or ctx.last_stats.dropped_groups:
+                    # A compact read notice is only valid while the earlier full
+                    # observation remains in the model view.
+                    st.clear_read_observations()
                     logger.event(
                         "context_prune",
                         step=step,
@@ -246,6 +274,10 @@ def run_task(
                             rejected=result.rejected,
                             blocked=result.blocked,
                             block_kind=result.block_kind,
+                            changed_files=result.changed_files,
+                            workspace_scan_complete=result.workspace_scan_complete,
+                            output_ref=result.output_ref,
+                            output_chars=result.output_chars,
                             revision=st.rev,
                             verified_revision=st.ok_rev,
                         )
@@ -272,11 +304,28 @@ def run_task(
                 continue
 
             final_text = entry.get("content") or "(model returned no content)"
-            if st.changed and st.ok_rev != st.rev:
+            workspace_delta = None
+            if st.verification_required():
+                workspace_delta = st.reconcile_workspace(config.WORKSPACE_DIR)
+                if workspace_delta.paths:
+                    logger.event(
+                        "workspace_reconcile",
+                        step=step,
+                        changed_files=list(workspace_delta.paths),
+                        workspace_scan_complete=workspace_delta.complete,
+                        revision=st.rev,
+                    )
+            if st.verification_required() and not st.verification_current():
                 feedback = (
                     "[Runtime] Current workspace revision has not been successfully verified. "
                     "Use check_command before finishing."
                 )
+                if workspace_delta is not None and workspace_delta.paths:
+                    feedback = (
+                        "[Runtime] Workspace files changed after the last successful verification: "
+                        + ", ".join(workspace_delta.paths[:20])
+                        + ". Inspect the current state and run check_command again before finishing."
+                    )
                 _store_group(
                     ctx,
                     [entry, {"role": "user", "content": feedback}],
@@ -310,6 +359,10 @@ def run_task(
                 verified_revision=st.ok_rev,
                 input_tokens=st.in_tok,
                 output_tokens=st.out_tok,
+                task_tokens=st.task_tokens,
+                elapsed_seconds=round(time.time() - st.start, 3),
+                workspace_tracking_complete=st.workspace_tracking_complete,
+                workspace_fingerprint=st.ok_workspace_fingerprint,
             )
             return final_text
 
@@ -380,6 +433,12 @@ def _new_active(task: str, logger, references: list[str] | None = None) -> Activ
         checkpoints=CheckpointManager(config.WORKSPACE_DIR, store.session_id),
         required_verifier=required_verifier,
     )
+    snapshot = st.initialize_workspace_tracking(config.WORKSPACE_DIR)
+    if not snapshot.complete:
+        ui.warning(
+            "Workspace tracking started in bounded/partial mode: "
+            + (snapshot.note or "snapshot limits were reached")
+        )
     st.begin_turn()
     active = ActiveSession(
         ctx=Ctx(system_prompt(project_context, initial_dirty), task),
@@ -399,7 +458,14 @@ def _resume_active(selector: str, logger) -> ActiveSession:
     st = restore_state(loaded.state, store.session_id)
     st.git_guard = guard
     st.checkpoints = CheckpointManager(config.WORKSPACE_DIR, store.session_id)
+    reconciled_files = reconcile_checkpoint_state(st, st.checkpoints.active())
+    if reconciled_files:
+        store.record_state(st, "resume_checkpoint_reconciliation")
     st.required_verifier = config.get_final_verifier(config.WORKSPACE_DIR)
+    snapshot = st.initialize_workspace_tracking(
+        config.WORKSPACE_DIR,
+        require_file_observation=True,
+    )
     active = ActiveSession(
         ctx=loaded.ctx,
         st=st,
@@ -414,7 +480,20 @@ def _resume_active(selector: str, logger) -> ActiveSession:
         revision=st.rev,
         previous_verified_revision=loaded.previous_verified_revision,
         verification_invalidated=True,
+        reconciled_files=reconciled_files,
+        workspace_tracking_complete=snapshot.complete,
     )
+    if not snapshot.complete:
+        ui.warning(
+            "Workspace tracking resumed in bounded/partial mode: "
+            + (snapshot.note or "snapshot limits were reached")
+        )
+    if reconciled_files:
+        ui.warning(
+            "Recovered Agent file effects that were newer than the durable session state: "
+            + ", ".join(reconciled_files)
+            + ". Verification is required."
+        )
     if loaded.previous_verified_revision >= 0:
         ui.warning(
             "Session resumed. Previous verification was invalidated; "
@@ -490,10 +569,10 @@ def _restore_checkpoint(active: ActiveSession, checkpoint_id: str | None) -> Non
     except CheckpointError as exc:
         ui.warning(str(exc))
         return
-    active.st.rev += 1
-    active.st.ok_rev = -1
-    active.st.changed = True
-    active.st.files.add(result.path)
+    active.st.note_agent_edit(result.path)
+    restored_path = Path(config.WORKSPACE_DIR, result.path)
+    restored_data = restored_path.read_bytes() if restored_path.is_file() else None
+    active.st.workspace_tracker.accept(restored_path, restored_data)
     active.store.record_state(active.st, f"restored_checkpoint:{result.checkpoint_id}")
     action = "deleted Agent-created file" if result.deleted_created_file else "restored before-image"
     ui.success(
@@ -569,11 +648,10 @@ def _interactive_loop(logger, active: ActiveSession | None = None) -> int:
 
         if raw.startswith("!"):
             cmd = raw[1:].strip()
-            result = tools.run_user_command(cmd)
+            result = tools.run_user_command(cmd, st=active.st if active is not None else None)
             print(result.text)
             observation = interactive.shell_observation(cmd, result)
             if active is not None:
-                active.st.note_user_shell()
                 active.store.record_state(active.st, "user_shell_command")
             try:
                 include = input("Include this command and output in model context? [Y/n]: ").strip().lower()
@@ -611,6 +689,11 @@ def _parser() -> argparse.ArgumentParser:
         help="One-shot programming task; omit it to enter interactive mode.",
     )
     parser.add_argument("--yes", action="store_true", help="Disable effect-tool confirmation for this process.")
+    parser.add_argument(
+        "--permission-mode",
+        choices=("balanced", "manual"),
+        help="Permission baseline for this process (default: balanced).",
+    )
     parser.add_argument("--workspace", help="Workspace directory for this run.")
     parser.add_argument(
         "--resume",
@@ -629,6 +712,8 @@ def main() -> int:
     if args.yes:
         config.REQUIRE_CONFIRMATION = False
         ui.warning("Confirmation disabled for this process.")
+    if args.permission_mode:
+        config.PERMISSION_MODE = args.permission_mode
 
     if getattr(args, "list_sessions", False) is True:
         _show_sessions()

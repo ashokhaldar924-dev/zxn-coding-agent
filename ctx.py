@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -34,7 +35,7 @@ def _message_chars(messages: list[dict]) -> int:
 
 
 def _message_tokens(messages: list[dict]) -> int:
-    """Provider-independent token estimate used only as a conservative budget."""
+    """Provider-independent approximation used only for context budgeting."""
 
     return math.ceil(len(_encoded(messages)) / 4)
 
@@ -145,9 +146,15 @@ class Ctx:
                 content = message.get("content")
                 if not isinstance(content, str) or content.startswith("[older tool output pruned:"):
                     continue
+                output_ref = re.search(r"\bcmd-[0-9a-f]{12}\.txt\b", content)
+                saved = (
+                    f"; full command output remains available as {output_ref.group(0)} "
+                    "via read_command_output"
+                    if output_ref
+                    else "; re-run the tool if exact details are still needed"
+                )
                 message["content"] = (
-                    f"[older tool output pruned: {len(content)} characters; "
-                    "re-run the tool if exact details are still needed.]"
+                    f"[older tool output pruned: {len(content)} characters{saved}.]"
                 )
                 pruned += 1
                 if not self._over_budget(self._assemble(history, current, runtime_state)):

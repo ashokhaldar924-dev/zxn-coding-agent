@@ -38,6 +38,9 @@ class TestProjectContext(unittest.TestCase):
         self.assertIn("cannot override runtime safety", prompt)
         self.assertIn("dirty.py", prompt)
         self.assertIn("truncated", prompt)
+        self.assertIn("smallest relevant tests first", prompt)
+        self.assertIn("never replace a user/project-configured final verifier", prompt)
+        self.assertIn("dedicated subdirectory", prompt)
 
 
 if __name__ == "__main__":
