@@ -148,6 +148,24 @@ class TestContext(unittest.TestCase):
         self.assertIn("runtime-anchor", json.dumps(messages))
         self.assertLessEqual(ctx.last_stats.after_tokens, ctx.last_stats.before_tokens)
 
+    def test_reserved_request_tokens_participate_in_context_budget(self):
+        config.MAX_CONTEXT_CHARS = 1_000_000
+        ctx = Ctx("system", "task")
+        ctx.add_group([{"role": "assistant", "content": "old-output-" + "X" * 800}])
+        ctx.add_group([{"role": "assistant", "content": "recent"}])
+        ctx.build()
+        config.MAX_CONTEXT_TOKENS = ctx.last_stats.after_tokens + 10
+
+        messages = ctx.build(reserved_tokens=80)
+
+        self.assertNotIn("old-output-", json.dumps(messages))
+        self.assertIn("recent", json.dumps(messages))
+        self.assertEqual(ctx.last_stats.reserved_tokens, 80)
+        self.assertEqual(
+            ctx.last_stats.estimated_window_tokens,
+            ctx.last_stats.after_tokens + 80,
+        )
+
     def test_multi_turn_history_is_durable_but_current_task_stays_anchored(self):
         config.MAX_GROUPS = 2
         ctx = Ctx("system", "first task")
@@ -190,6 +208,15 @@ class TestRunLog(unittest.TestCase):
         self.assertEqual([event["event"] for event in events], ["task", "fatal_error"])
         self.assertNotIn("super-secret-value", "\n".join(lines))
         self.assertEqual(events[1]["authorization"], "[REDACTED]")
+
+    def test_optional_event_sink_receives_only_redacted_events(self):
+        received = []
+        logger = RunLog(self.tmpdir, event_sink=received.append)
+        logger.event("tool_result", text="super-secret-value")
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["event"], "tool_result")
+        self.assertEqual(received[0]["text"], "[REDACTED]")
 
 
 if __name__ == "__main__":

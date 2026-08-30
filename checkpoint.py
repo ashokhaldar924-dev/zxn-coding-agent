@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from changes import FileChange, FileDiff, summarize_byte_change, unified_byte_diff
+
 
 class CheckpointError(RuntimeError):
     """Raised when a checkpoint cannot be created or safely restored."""
@@ -176,6 +178,116 @@ class CheckpointManager:
 
     def active(self) -> list[dict[str, Any]]:
         return list(self._records())
+
+    def change_summaries(self, start_index: int = 0) -> list[FileChange]:
+        """Summarize active direct Agent edits against their earliest before-images."""
+
+        if start_index < 0:
+            raise ValueError("start_index must be >= 0")
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for record in self._records()[start_index:]:
+            grouped.setdefault(str(record["path"]), []).append(record)
+
+        summaries: list[FileChange] = []
+        for path, records in grouped.items():
+            first = records[0]
+            latest = records[-1]
+            target = self._safe_target(path)
+            current = target.read_bytes() if target.is_file() else None
+            current_hash = _sha(current) if current is not None else None
+            if current_hash != latest.get("after_hash"):
+                # A later shell/user change means the Agent checkpoint can no
+                # longer provide truthful net line counts for the current file.
+                continue
+            before = None
+            if bool(first.get("existed")):
+                blob = self.blobs / str(first.get("before_blob"))
+                if not blob.is_file():
+                    continue
+                before = blob.read_bytes()
+                if _sha(before) != first.get("before_hash"):
+                    continue
+            summaries.append(summarize_byte_change(path, before, current))
+        return summaries
+
+    def file_diff(
+        self,
+        relative_path: str,
+        *,
+        start_index: int = 0,
+        max_chars: int = 60_000,
+    ) -> FileDiff:
+        """Return a bounded diff proven by checkpoint before/after hashes."""
+
+        if start_index < 0:
+            raise ValueError("start_index must be >= 0")
+        records = [
+            record
+            for record in self._records()[start_index:]
+            if str(record.get("path")) == relative_path
+        ]
+        if not records:
+            raise CheckpointError(
+                f"No direct Agent file checkpoint is available for {relative_path!r}."
+            )
+        first, latest = records[0], records[-1]
+        target = self._safe_target(relative_path)
+        after = target.read_bytes() if target.is_file() else None
+        after_hash = _sha(after) if after is not None else None
+        if after_hash != latest.get("after_hash"):
+            raise CheckpointError(
+                f"Cannot show a trusted diff for {relative_path}: the file changed "
+                "after the latest Agent checkpoint."
+            )
+        before = None
+        if bool(first.get("existed")):
+            blob = self.blobs / str(first.get("before_blob"))
+            if not blob.is_file():
+                raise CheckpointError(f"Before-image for {relative_path!r} is missing.")
+            before = blob.read_bytes()
+            if _sha(before) != first.get("before_hash"):
+                raise CheckpointError(f"Before-image for {relative_path!r} failed its hash check.")
+        return unified_byte_diff(
+            relative_path,
+            before,
+            after,
+            max_chars=max_chars,
+        )
+
+    def restore_since(self, start_index: int = 0) -> list[RestoreResult]:
+        """Restore one task's checkpoints after preflighting every touched file."""
+
+        if start_index < 0:
+            raise ValueError("start_index must be >= 0")
+        records = self._records()[start_index:]
+        if not records:
+            raise CheckpointError("No restorable Agent file checkpoint exists for this task.")
+
+        latest_by_path: dict[str, dict[str, Any]] = {}
+        for record in records:
+            latest_by_path[str(record["path"])] = record
+            if bool(record.get("existed")):
+                blob = self.blobs / str(record.get("before_blob"))
+                if not blob.is_file():
+                    raise CheckpointError(f"Before-image for {record['id']} is missing.")
+                before = blob.read_bytes()
+                if _sha(before) != record.get("before_hash"):
+                    raise CheckpointError(
+                        f"Before-image for {record['id']} failed its hash check."
+                    )
+
+        # Check every final file state before changing any file. This prevents
+        # a known external edit from causing a partial multi-file restore.
+        for path, record in latest_by_path.items():
+            target = self._safe_target(path)
+            current_hash = _sha(target.read_bytes()) if target.is_file() else None
+            if current_hash != record.get("after_hash"):
+                raise CheckpointError(
+                    f"Refusing to restore task changes: {path} changed after the "
+                    "latest Agent edit. Preserve or reconcile the newer user change first."
+                )
+
+        return [self.restore(str(record["id"])) for record in reversed(records)]
 
     def restore(self, checkpoint_id: str | None = None) -> RestoreResult:
         records = self._records()

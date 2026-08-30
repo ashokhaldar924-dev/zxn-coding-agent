@@ -1,15 +1,38 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config  # noqa: E402
+import config
+
+
+class TestPersistentEnvironmentConfig(unittest.TestCase):
+    def test_process_environment_has_precedence(self):
+        with patch.dict(
+            os.environ, {"AGENT_TEST_SETTING": "process"}, clear=False
+        ), patch.object(config, "_windows_user_environment", return_value="persistent"):
+            self.assertEqual(config._setting("AGENT_TEST_SETTING"), "process")
+
+    def test_persistent_user_environment_is_a_fallback(self):
+        with patch.dict(os.environ, {}, clear=False), patch.object(
+            config, "_windows_user_environment", return_value="persistent"
+        ):
+            os.environ.pop("AGENT_TEST_SETTING", None)
+            self.assertEqual(config._setting("AGENT_TEST_SETTING"), "persistent")
+
+    def test_api_key_uses_persistent_user_environment(self):
+        with patch.dict(os.environ, {}, clear=False), patch.object(
+            config, "_windows_user_environment", return_value="saved-key"
+        ):
+            os.environ.pop("AGENT_API_KEY", None)
+            self.assertEqual(config.get_api_key(), "saved-key")
 
 
 class TestFinalVerifierConfig(unittest.TestCase):

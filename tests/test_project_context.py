@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import agent  # noqa: E402
-import config  # noqa: E402
-from project_context import load_project_context  # noqa: E402
+import agent
+import config
+from project_context import load_project_context
 
 
 class TestProjectContext(unittest.TestCase):

@@ -30,6 +30,8 @@ def _hash_tests(workspace: Path) -> dict[str, str]:
         path.relative_to(workspace).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted((workspace / "tests").glob("**/*"))
         if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix.lower() not in {".pyc", ".pyo"}
     }
 
 
@@ -60,6 +62,43 @@ def _run_verifier(workspace: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _run_hidden_verifier(
+    case: dict,
+    workspace: Path,
+    base: Path,
+    label: str,
+) -> subprocess.CompletedProcess[str]:
+    """Materialize the hidden grader only after copying the current implementation."""
+
+    hidden = base / f"_hidden-{case['name']}-{label}"
+    if hidden.exists():
+        shutil.rmtree(hidden)
+    hidden.mkdir(parents=True)
+    try:
+        for source in workspace.iterdir():
+            if source.name in {
+                "tests",
+                ".agent",
+                ".git",
+                "__pycache__",
+                "AGENTS.md",
+                ".agent-verifier",
+            }:
+                continue
+            target = hidden / source.name
+            if source.is_dir():
+                shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            elif source.is_file():
+                shutil.copy2(source, target)
+        for relative, content in case.get("hidden_files", {}).items():
+            path = hidden / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8", newline="\n")
+        return _run_verifier(hidden)
+    finally:
+        shutil.rmtree(hidden, ignore_errors=True)
+
+
 def _trajectory_metrics(workspace: Path) -> dict:
     logs = sorted((workspace / ".agent").glob("run-*.jsonl"))
     if not logs:
@@ -81,6 +120,27 @@ def _trajectory_metrics(workspace: Path) -> dict:
         if isinstance(value, dict):
             events.append(value)
     final = next((event for event in reversed(events) if event.get("event") == "final"), {})
+    termination = next(
+        (
+            event
+            for event in reversed(events)
+            if event.get("event")
+            in {
+                "final",
+                "no_progress",
+                "max_steps",
+                "max_time",
+                "max_errors",
+                "max_task_tokens",
+                "content_filter",
+                "incomplete_model_output",
+                "user_stopped",
+                "interrupted",
+                "fatal_error",
+            }
+        ),
+        {},
+    )
     checks = [
         event
         for event in events
@@ -96,6 +156,7 @@ def _trajectory_metrics(workspace: Path) -> dict:
     return {
         "trajectory": str(path.relative_to(workspace)),
         "tool_calls": sum(event.get("event") == "tool_call" for event in events),
+        "model_calls": sum(event.get("event") == "model_response" for event in events),
         "tool_errors": sum(
             event.get("event") == "tool_result" and event.get("ok") is False
             for event in events
@@ -127,18 +188,23 @@ def _trajectory_metrics(workspace: Path) -> dict:
         "verified_revision": final.get("verified_revision"),
         "has_final": bool(final),
         "task_elapsed_seconds": final.get("elapsed_seconds"),
+        "no_progress": any(event.get("event") == "no_progress" for event in events),
+        "termination_reason": termination.get("event"),
     }
 
 
-def run_case(case: dict, base: Path, dry_run: bool) -> dict:
-    workspace = base / case["name"]
+def run_case(case: dict, base: Path, dry_run: bool, run_index: int = 1) -> dict:
+    workspace = base / f"{case['name']}-run-{run_index}"
     materialize(case, workspace)
     test_hashes = _hash_tests(workspace)
     baseline = _run_verifier(workspace)
+    hidden_baseline = _run_hidden_verifier(case, workspace, base, f"baseline-{run_index}")
     result = {
         "name": case["name"],
+        "run": run_index,
         "baseline_exit": baseline.returncode,
-        "fixture_valid": baseline.returncode != 0,
+        "hidden_baseline_exit": hidden_baseline.returncode,
+        "fixture_valid": baseline.returncode != 0 and hidden_baseline.returncode != 0,
     }
     if dry_run:
         return result
@@ -159,6 +225,7 @@ def run_case(case: dict, base: Path, dry_run: bool) -> dict:
     )
     duration = time.monotonic() - started
     final_check = _run_verifier(workspace)
+    hidden_check = _run_hidden_verifier(case, workspace, base, f"final-{run_index}")
     tests_unchanged = _hash_tests(workspace) == test_hashes
     metrics = _trajectory_metrics(workspace)
     result.update(metrics)
@@ -166,16 +233,23 @@ def run_case(case: dict, base: Path, dry_run: bool) -> dict:
         "agent_exit": proc.returncode,
         "duration_seconds": round(duration, 3),
         "final_verifier_exit": final_check.returncode,
+        "hidden_verifier_exit": hidden_check.returncode,
+        "hidden_pass": hidden_check.returncode == 0,
         "tests_unchanged": tests_unchanged,
         "success": bool(
             result["fixture_valid"]
             and proc.returncode == 0
             and final_check.returncode == 0
+            and hidden_check.returncode == 0
             and tests_unchanged
             and metrics.get("has_final")
             and metrics.get("final_revision") == metrics.get("verified_revision")
         ),
         "failure_recovery": metrics.get("failed_checks", 0) > 0 and final_check.returncode == 0,
+        "false_completion": bool(
+            metrics.get("has_final")
+            and (final_check.returncode != 0 or hidden_check.returncode != 0)
+        ),
         "stdout_tail": proc.stdout[-2_000:],
         "stderr_tail": proc.stderr[-2_000:],
     })
@@ -190,6 +264,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", action="append", dest="cases", help="Run only a named case; repeatable.")
     parser.add_argument("--limit", type=int, default=len(CASES))
+    parser.add_argument("--repeat", type=int, default=1, help="Repeat every selected case N times.")
     parser.add_argument("--dry-run", action="store_true", help="Validate fixtures without calling a model.")
     parser.add_argument("--keep-workspaces", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -199,6 +274,8 @@ def main() -> int:
     selected = selected[: max(0, args.limit)]
     if not selected:
         parser.error("no evaluation cases selected")
+    if args.repeat < 1:
+        parser.error("--repeat must be >= 1")
     if not args.dry_run:
         missing = [name for name in ("AGENT_API_KEY", "AGENT_MODEL") if not os.environ.get(name)]
         if missing:
@@ -206,7 +283,11 @@ def main() -> int:
 
     temp_root = Path(tempfile.mkdtemp(prefix="zxn-agent-eval-"))
     try:
-        results = [run_case(case, temp_root, args.dry_run) for case in selected]
+        results = [
+            run_case(case, temp_root, args.dry_run, run_index)
+            for case in selected
+            for run_index in range(1, args.repeat + 1)
+        ]
         report = {
             "created": datetime.now().astimezone().isoformat(timespec="seconds"),
             "dry_run": args.dry_run,
@@ -221,8 +302,14 @@ def main() -> int:
                     if not args.dry_run
                     else None
                 ),
+                "hidden_passes": sum(result.get("hidden_pass", False) for result in results),
+                "false_completions": sum(
+                    result.get("false_completion", False) for result in results
+                ),
+                "no_progress_stops": sum(result.get("no_progress", False) for result in results),
                 "total_tokens": sum(result.get("tokens", 0) for result in results),
                 "tool_calls": sum(result.get("tool_calls", 0) for result in results),
+                "model_calls": sum(result.get("model_calls", 0) for result in results),
                 "verification_attempts": sum(
                     result.get("verification_attempts", 0) for result in results
                 ),

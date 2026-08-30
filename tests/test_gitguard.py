@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gitguard import GitGuard  # noqa: E402
+from gitguard import GitGuard
 
 
 class TestGitGuard(unittest.TestCase):
@@ -29,9 +29,19 @@ class TestGitGuard(unittest.TestCase):
                 stdout=" M tracked.py\0?? new file.py\0R  renamed.py\0old.py\0",
                 stderr="",
             )
-            with mock.patch("gitguard.subprocess.run", side_effect=[root_result, status_result]):
+            head_result = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="abc123\n",
+                stderr="",
+            )
+            with mock.patch(
+                "gitguard.subprocess.run",
+                side_effect=[root_result, head_result, status_result],
+            ):
                 guard = GitGuard.scan(repo)
             self.assertTrue(guard.active)
+            self.assertEqual(guard.head, "abc123")
             self.assertEqual(
                 guard.initial_dirty,
                 {
@@ -52,6 +62,7 @@ class TestGitGuard(unittest.TestCase):
             guard = GitGuard.scan("D:/not-a-repository")
         self.assertFalse(guard.active)
         self.assertEqual(guard.initial_dirty, set())
+        self.assertIsNone(guard.head)
 
     def test_display_paths_omits_dirty_files_outside_workspace(self):
         with tempfile.TemporaryDirectory() as tmpdir:

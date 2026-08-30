@@ -108,6 +108,7 @@ def status_text(st: State, session_path: Path | None, checkpoint_count: int) -> 
         f"revision: {st.rev}; verified current revision: {verified}\n"
         f"tracked changed files: {', '.join(sorted(st.files)) if st.files else 'none'}\n"
         f"workspace tracking complete: {'yes' if st.workspace_tracking_complete else 'no (partial)'}\n"
+        f"plan: {st.plan.progress_text()}\n"
         f"active checkpoints: {checkpoint_count}\n"
         f"tokens: session {st.in_tok + st.out_tok}; current task {st.task_tokens}"
     )

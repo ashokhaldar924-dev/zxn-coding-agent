@@ -74,9 +74,15 @@ def call(msgs: list[dict], schemas: list[dict]) -> tuple[dict, dict]:
 
     try:
         data = response.json()
-        message = data["choices"][0]["message"]
+        choice = data["choices"][0]
+        message = choice["message"]
         if not isinstance(message, dict):
             raise TypeError("assistant message is not an object")
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            raise TypeError("finish_reason is not a string or null")
+        message = dict(message)
+        message["_finish_reason"] = finish_reason
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise LLMError(
             f"Invalid model response: {exc}. Body: {_safe_text(response.text)}"

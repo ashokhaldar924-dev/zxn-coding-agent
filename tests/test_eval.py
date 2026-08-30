@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from evals.cases import CASES
 from evals.run_eval import (
     _hash_tests,
+    _run_hidden_verifier,
     _run_verifier,
     _trajectory_metrics,
     materialize,
@@ -20,6 +21,17 @@ from evals.run_eval import (
 
 
 class TestEvalFixtures(unittest.TestCase):
+    def test_generated_bytecode_does_not_count_as_a_test_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            tests = workspace / "tests"
+            cache = tests / "__pycache__"
+            cache.mkdir(parents=True)
+            (tests / "test_example.py").write_text("assert True\n", encoding="utf-8")
+            before = _hash_tests(workspace)
+            (cache / "test_example.cpython-312.pyc").write_bytes(b"generated")
+            self.assertEqual(_hash_tests(workspace), before)
+
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
 
@@ -32,9 +44,15 @@ class TestEvalFixtures(unittest.TestCase):
             workspace = Path(self.tmpdir, case["name"])
             materialize(case, workspace)
             self.assertNotEqual(_run_verifier(workspace).returncode, 0, case["name"])
+            self.assertNotEqual(
+                _run_hidden_verifier(case, workspace, Path(self.tmpdir), "baseline").returncode,
+                0,
+                case["name"],
+            )
             hashes = _hash_tests(workspace)
             self.assertTrue(hashes)
             self.assertTrue((workspace / ".agent-verifier").is_file())
+            self.assertFalse(any(workspace.rglob("test_hidden_*.py")))
 
     def test_trajectory_metrics_capture_first_check_recovery_cost_and_time(self):
         workspace = Path(self.tmpdir, "metrics")
@@ -85,6 +103,8 @@ class TestEvalFixtures(unittest.TestCase):
         self.assertEqual(metrics["saved_command_outputs"], 1)
         self.assertEqual(metrics["tokens"], 150)
         self.assertEqual(metrics["task_elapsed_seconds"], 2.5)
+        self.assertEqual(metrics["model_calls"], 1)
+        self.assertFalse(metrics["no_progress"])
 
 
 if __name__ == "__main__":

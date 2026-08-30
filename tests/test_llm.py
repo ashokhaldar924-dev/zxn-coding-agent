@@ -8,8 +8,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config  # noqa: E402
-import llm  # noqa: E402
+import config
+import llm
 
 
 class FakeResponse:
@@ -53,13 +53,14 @@ class TestLLM(unittest.TestCase):
         def post(url, **kwargs):
             captured.update(url=url, **kwargs)
             return FakeResponse(data={
-                "choices": [{"message": {"content": "ok"}}],
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
             })
 
         with self.install_fake(post):
             message, usage = llm.call([{"role": "user", "content": "hi"}], [{"type": "function"}])
         self.assertEqual(message["content"], "ok")
+        self.assertEqual(message["_finish_reason"], "stop")
         self.assertEqual(usage, {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12})
         self.assertEqual(captured["url"], "https://example.test/v1/chat/completions")
         self.assertEqual(captured["json"]["tool_choice"], "auto")
@@ -86,11 +87,20 @@ class TestLLM(unittest.TestCase):
         def post(url, **kwargs):
             return FakeResponse(data={"bad": "shape"}, text="test-secret malformed")
 
-        with self.install_fake(post):
-            with self.assertRaises(llm.LLMError) as caught:
-                llm.call([], [])
+        with self.install_fake(post), self.assertRaises(llm.LLMError) as caught:
+            llm.call([], [])
         self.assertIn("Invalid model response", str(caught.exception))
         self.assertNotIn("test-secret", str(caught.exception))
+
+    def test_invalid_finish_reason_shape_is_rejected(self):
+        def post(url, **kwargs):
+            return FakeResponse(data={
+                "choices": [{"message": {"content": "bad"}, "finish_reason": ["stop"]}],
+            })
+
+        with self.install_fake(post), self.assertRaises(llm.LLMError) as caught:
+            llm.call([], [])
+        self.assertIn("finish_reason", str(caught.exception))
 
 
 if __name__ == "__main__":

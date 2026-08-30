@@ -17,14 +17,16 @@ class ContextStats:
     after_chars: int = 0
     before_tokens: int = 0
     after_tokens: int = 0
+    reserved_tokens: int = 0
+    estimated_window_tokens: int = 0
     pruned_tool_outputs: int = 0
     dropped_groups: int = 0
     over_budget: bool = False
 
 
-def _encoded(messages: list[dict]) -> bytes:
+def _encoded(value: object) -> bytes:
     return json.dumps(
-        messages,
+        value,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -38,6 +40,12 @@ def _message_tokens(messages: list[dict]) -> int:
     """Provider-independent approximation used only for context budgeting."""
 
     return math.ceil(len(_encoded(messages)) / 4)
+
+
+def estimate_tokens(value: object) -> int:
+    """Estimate serialized request tokens with the same deterministic heuristic."""
+
+    return math.ceil(len(_encoded(value)) / 4)
 
 
 def _flatten(groups: list[list[dict]]) -> list[dict]:
@@ -117,13 +125,20 @@ class Ctx:
         return messages
 
     @staticmethod
-    def _over_budget(messages: list[dict]) -> bool:
+    def _over_budget(messages: list[dict], reserved_tokens: int) -> bool:
         return (
             _message_chars(messages) > config.MAX_CONTEXT_CHARS
-            or _message_tokens(messages) > config.MAX_CONTEXT_TOKENS
+            or _message_tokens(messages) + reserved_tokens > config.MAX_CONTEXT_TOKENS
         )
 
-    def build(self, runtime_state: str | None = None) -> list[dict]:
+    def build(
+        self,
+        runtime_state: str | None = None,
+        *,
+        reserved_tokens: int = 0,
+    ) -> list[dict]:
+        if not isinstance(reserved_tokens, int) or reserved_tokens < 0:
+            raise ValueError("reserved_tokens must be a non-negative integer")
         # MAX_GROUPS limits only the model view. The durable transcript remains
         # complete in history_groups/groups and in the session JSONL.
         current = deepcopy(self.groups[-config.MAX_GROUPS :])
@@ -138,7 +153,9 @@ class Ctx:
 
         protected_from = max(0, len(current) - config.CONTEXT_KEEP_FULL_GROUPS)
         for group in [*history, *current[:protected_from]]:
-            if not self._over_budget(self._assemble(history, current, runtime_state)):
+            if not self._over_budget(
+                self._assemble(history, current, runtime_state), reserved_tokens
+            ):
                 break
             for message in group:
                 if message.get("role") != "tool":
@@ -157,16 +174,22 @@ class Ctx:
                     f"[older tool output pruned: {len(content)} characters{saved}.]"
                 )
                 pruned += 1
-                if not self._over_budget(self._assemble(history, current, runtime_state)):
+                if not self._over_budget(
+                    self._assemble(history, current, runtime_state), reserved_tokens
+                ):
                     break
 
-        while history and self._over_budget(self._assemble(history, current, runtime_state)):
+        while history and self._over_budget(
+            self._assemble(history, current, runtime_state), reserved_tokens
+        ):
             history.pop(0)
             dropped += 1
 
         while (
             len(current) > config.CONTEXT_KEEP_FULL_GROUPS
-            and self._over_budget(self._assemble(history, current, runtime_state))
+            and self._over_budget(
+                self._assemble(history, current, runtime_state), reserved_tokens
+            )
         ):
             current.pop(0)
             dropped += 1
@@ -179,8 +202,10 @@ class Ctx:
             after_chars=after_chars,
             before_tokens=before_tokens,
             after_tokens=after_tokens,
+            reserved_tokens=reserved_tokens,
+            estimated_window_tokens=after_tokens + reserved_tokens,
             pruned_tool_outputs=pruned,
             dropped_groups=dropped,
-            over_budget=self._over_budget(messages),
+            over_budget=self._over_budget(messages, reserved_tokens),
         )
         return messages

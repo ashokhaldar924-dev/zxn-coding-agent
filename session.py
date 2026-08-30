@@ -12,6 +12,7 @@ from typing import Any
 
 from ctx import Ctx
 from log import redact
+from planner import PlanState
 from state import State
 
 SESSION_VERSION = 1
@@ -27,10 +28,17 @@ class LoadedSession:
     state: dict[str, Any]
     previous_verified_revision: int
     original_model: str
+    expected_git_head: str | None
 
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def _dict_items(value: object, limit: int) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)][-limit:]
 
 
 def _state_data(st: State) -> dict[str, Any]:
@@ -43,16 +51,28 @@ def _state_data(st: State) -> dict[str, Any]:
         "out_tok": st.out_tok,
         "task_in_tok": st.task_in_tok,
         "task_out_tok": st.task_out_tok,
+        "task_model_calls": st.task_model_calls,
+        "task_tool_calls": st.task_tool_calls,
+        "check_attempts": st.check_attempts,
+        "task_evidence": st.task_evidence,
+        "planner_task": st.planner_task,
         "last_check_cmd": st.last_check_cmd,
         "last_check_rc": st.last_check_rc,
         "last_check_rev": st.last_check_rev,
         "external_change_possible": st.external_change_possible,
+        "requires_full_verification": st.requires_full_verification,
+        "verified_scope": st.verified_scope,
+        "plan": st.plan.to_data(),
     }
 
 
 def restore_state(data: dict[str, Any], session_id: str) -> State:
     """Restore durable progress but deliberately reset process-local safety state."""
 
+    try:
+        plan = PlanState.from_data(data.get("plan"))
+    except (TypeError, ValueError) as exc:
+        raise SessionError("Session contains invalid plan state.") from exc
     return State(
         rev=max(0, int(data.get("rev", 0))),
         # Verification never survives a process boundary: files may have
@@ -64,6 +84,10 @@ def restore_state(data: dict[str, Any], session_id: str) -> State:
         out_tok=max(0, int(data.get("out_tok", 0))),
         task_in_tok=max(0, int(data.get("task_in_tok", 0))),
         task_out_tok=max(0, int(data.get("task_out_tok", 0))),
+        task_model_calls=max(0, int(data.get("task_model_calls", 0))),
+        task_tool_calls=max(0, int(data.get("task_tool_calls", 0))),
+        check_attempts=_dict_items(data.get("check_attempts"), 20),
+        task_evidence=_dict_items(data.get("task_evidence"), 100),
         last_check_cmd=(
             str(data["last_check_cmd"])
             if data.get("last_check_cmd") is not None
@@ -80,7 +104,19 @@ def restore_state(data: dict[str, Any], session_id: str) -> State:
             else None
         ),
         external_change_possible=bool(data.get("external_change_possible", False)),
+        requires_full_verification=bool(data.get("requires_full_verification", False)),
+        verified_scope=(
+            str(data["verified_scope"])
+            if data.get("verified_scope") is not None
+            else None
+        ),
         session_id=session_id,
+        plan=plan,
+        planner_task=(
+            str(data["planner_task"])
+            if data.get("planner_task") is not None
+            else ""
+        ),
     )
 
 
@@ -123,7 +159,14 @@ class SessionStore:
         return Path(workspace).resolve() / ".agent" / "sessions"
 
     @classmethod
-    def create(cls, workspace: str | Path, model: str, task: str) -> SessionStore:
+    def create(
+        cls,
+        workspace: str | Path,
+        model: str,
+        task: str,
+        *,
+        git_head: str | None = None,
+    ) -> SessionStore:
         root = Path(workspace).resolve()
         folder = cls.directory(root)
         folder.mkdir(parents=True, exist_ok=True)
@@ -138,6 +181,7 @@ class SessionStore:
             "created": _now(),
             "workspace": str(root),
             "model": model,
+            "git_head": git_head,
         })
         store.record_task(task)
         return store
@@ -188,6 +232,14 @@ class SessionStore:
     def record_task(self, task: str) -> None:
         self._append({"type": "task", "time": _now(), "text": task})
 
+    def record_git_base(self, git_head: str, previous: str | None) -> None:
+        self._append({
+            "type": "git_base",
+            "time": _now(),
+            "git_head": git_head,
+            "previous": previous,
+        })
+
     def record_group(self, messages: list[dict], st: State) -> None:
         self._append({
             "type": "group",
@@ -211,6 +263,33 @@ class SessionStore:
             "reason": reason,
             "state": _state_data(st),
         })
+
+    def record_outcome(
+        self,
+        *,
+        text: str,
+        completed: bool,
+        changes: list[dict[str, Any]],
+        verification: dict[str, Any],
+        steps: int,
+        elapsed_seconds: float,
+        report: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist the Runtime-owned final snapshot used by desktop history."""
+
+        entry = {
+            "type": "outcome",
+            "time": _now(),
+            "text": text,
+            "completed": completed,
+            "changes": changes,
+            "verification": verification,
+            "steps": steps,
+            "elapsed_seconds": elapsed_seconds,
+        }
+        if report is not None:
+            entry["report"] = report
+        self._append(entry)
 
     @staticmethod
     def _read_entries(path: Path) -> list[dict[str, Any]]:
@@ -244,6 +323,9 @@ class SessionStore:
 
         ctx: Ctx | None = None
         latest_state: dict[str, Any] = {}
+        expected_git_head = (
+            str(header["git_head"]) if header.get("git_head") else None
+        )
         for entry in entries[1:]:
             kind = entry.get("type")
             if kind == "task":
@@ -270,6 +352,8 @@ class SessionStore:
                     latest_state = entry["state"]
             elif kind == "state" and isinstance(entry.get("state"), dict):
                 latest_state = entry["state"]
+            elif kind == "git_base" and entry.get("git_head"):
+                expected_git_head = str(entry["git_head"])
 
         if ctx is None:
             raise SessionError("Session does not contain a user task.")
@@ -278,6 +362,7 @@ class SessionStore:
             state=latest_state,
             previous_verified_revision=int(latest_state.get("ok_rev", -1)),
             original_model=str(header.get("model", "")),
+            expected_git_head=expected_git_head,
         )
 
     @classmethod
@@ -293,17 +378,43 @@ class SessionStore:
             try:
                 entries = cls._read_entries(path)
                 header = entries[0]
-                first_task = next(
-                    (entry.get("text", "") for entry in entries if entry.get("type") == "task"),
-                    "",
-                )
+                tasks = [
+                    str(entry.get("text", ""))
+                    for entry in entries
+                    if entry.get("type") == "task"
+                ]
                 task_count = sum(entry.get("type") == "task" for entry in entries)
+                outcome = next(
+                    (entry for entry in reversed(entries) if entry.get("type") == "outcome"),
+                    None,
+                )
+                verification = (
+                    outcome.get("verification", {})
+                    if isinstance(outcome, dict)
+                    and isinstance(outcome.get("verification"), dict)
+                    else {}
+                )
+                status = "unknown"
+                if isinstance(outcome, dict):
+                    if (
+                        outcome.get("completed") is True
+                        and verification.get("current") is True
+                        and verification.get("adequate") is True
+                    ):
+                        status = "verified"
+                    elif outcome.get("completed") is True:
+                        status = "completed"
+                    else:
+                        status = "stopped"
                 summaries.append({
                     "id": header.get("id", ""),
                     "path": path,
-                    "task": str(first_task)[:80],
+                    "task": (tasks[-1] if tasks else "")[:120],
                     "tasks": task_count,
                     "updated": datetime.fromtimestamp(path.stat().st_mtime).astimezone(),
+                    "model": str(header.get("model", "")),
+                    "status": status,
+                    "outcome": outcome,
                 })
             except (OSError, SessionError):
                 continue

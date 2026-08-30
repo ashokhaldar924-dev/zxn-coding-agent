@@ -7,11 +7,16 @@
 ## Features
 
 - 持续执行 `LLM -> tool calls -> local results -> LLM`，完整处理工具协议、错误与终止条件。
-- 提供文件读取、精确编辑、代码搜索、Python Repo Map、命令执行和验证等 10 个本地工具。
+- 提供文件读取、原子精确编辑、代码搜索、多语言 Repo Map、轻量规划、命令执行和验证等 12 个本地工具。
 - 支持 one-shot 与交互式会话，可恢复 Session，并可通过 Checkpoint 撤销 Agent 的文件修改。
+- 复杂任务可维护可恢复的轻量 Plan；Plan 只展示方向，最终完成仍由真实验证状态决定。
+- 终端与可选桌面 GUI 都以紧凑时间线展示 Plan、代码操作、真实文件行数、命令结果和最终验证，不输出原始 tool JSON。
 - 使用 PermissionManager、GitGuard 和 workspace 边界保护已有工作与敏感文件。
 - 将验证结果绑定到具体 workspace fingerprint；验证后代码再次变化时拒绝结束。
-- 对长命令输出、重复读取和历史上下文进行有界处理，支持可选的任务 Token 预算。
+- 区分验证新鲜度与充分性；用户明确要求全部测试时，局部测试通过不能打开最终门禁。
+- 对连续失败的 `check_command` 建立去噪指纹；相同失败三次未推进时明确以 `NO_PROGRESS` 停止。
+- 最终结果、Plan Evidence、恢复和报告都来自 Runtime 事实，不根据模型总结猜测完成状态。
+- 对工具 schema、输出预留、长结果和历史上下文统一做有界处理，支持可选的任务 Token 预算。
 
 ## Quick start
 
@@ -31,7 +36,7 @@ $env:AGENT_BASE_URL="https://your-endpoint"
 $env:AGENT_MODEL="your-model-name"
 ```
 
-API Key 只从环境变量读取。其他可选参数见 [`.env.example`](.env.example)。
+API Key 只从环境变量读取；Windows 下也会读取当前用户的持久环境变量，旧终端无需重复设置。其他可选参数见 [`.env.example`](.env.example)。
 
 ### Run a task
 
@@ -65,6 +70,38 @@ python .\agent.py --workspace "D:\path\to\project"
 | `!command` | 由用户主动执行命令，并选择是否发送结果给模型 |
 | `/help`、`/exit` | 查看帮助或退出 |
 
+终端只呈现当前任务需要的信息，例如：
+
+```text
+Plan
+  ✓ Inspect implementation
+  ● Apply focused fix
+  ○ Run verification
+
+  Modified src/state.py
+    +14  -5
+
+• Verifying with pytest -q
+  ✓ 144 passed
+
+FINAL VERIFIED
+```
+
+TTY 使用少量颜色；重定向、CI 或不支持 Unicode 的 Windows 输出自动退化为无 ANSI 的纯文本。
+
+### Desktop GUI
+
+GUI 是可选的 PySide6 单窗口界面，不影响基础 CLI 依赖：
+
+```powershell
+python -m pip install -r requirements-gui.txt
+python .\agent.py --gui --workspace "D:\path\to\project"
+```
+
+界面左侧提供当前工作区的只读项目树和本轮 Changes，中间显示任务、工具、文件变化与命令摘要，右侧固定显示 Plan 和 Runtime Verification。顶部可以切换或重新打开最近工作区，并从本地 Session History 恢复任务；底部直接输入自然语言任务。Plan 下方的 Evidence 只引用真实工具事件。
+
+运行期间 `Run` 会切换为 `Stop`。停止请求会中止正在执行的普通命令进程树，忽略尚未返回的模型响应，并把任务明确标记为 `STOPPED`，不会把最近一次局部或历史验证渲染成 `FINAL VERIFIED`。文件预览是只读的；Changes 中的 Diff 只来自 Checkpoint 保存的 before-image 与当前文件，不会根据日志或模型文本猜测内容。`Restore` 只撤销本轮由文件工具造成且未被外部改写的变化，`Export` 导出由 Runtime 生成的 Evidence Report；恢复后旧验证立即失效。
+
 ## Runtime
 
 ```mermaid
@@ -85,24 +122,28 @@ flowchart LR
 
 | 类型 | 工具 | 作用 |
 | --- | --- | --- |
-| Observe | `read_file` | 按行读取工作区文本 |
+| Observe | `read_file` | 按行读取文本，限制超长单行并提供续读位置 |
 | Observe | `read_command_output` | 分段读取已保存的长命令输出 |
-| Observe | `list_dir` | 查看一层目录 |
-| Observe | `glob_files` | 按相对 glob 查找文件 |
-| Observe | `search_text` | 字面或正则搜索 |
-| Observe | `repo_map` | 提取 Python 类、函数、方法和行号 |
+| Observe | `list_dir` | 分页查看一层目录 |
+| Observe | `glob_files` | 分页执行相对 glob 查找 |
+| Observe | `search_text` | 分页执行字面或正则搜索 |
+| Observe | `repo_map` | 提取 Python 及常见编程语言的声明与行号 |
+| Navigate | `update_plan` | 调查现有仓库后更新任务特有的技术里程碑，不参与验证门禁 |
 | Effect | `write_file` | 创建或完整改写文件 |
 | Effect | `edit_file` | 对唯一匹配片段进行精确替换 |
-| Effect | `run_command` | 执行探索、构建或诊断命令 |
+| Effect | `multi_edit` | 在一个文件中原子应用多个有序精确替换 |
+| Effect | `run_command` | 以有界内存执行探索、构建或诊断命令 |
 | Effect | `check_command` | 验证当前 workspace revision |
 
 ### Safety and state
 
 - 文件工具只访问解析后仍位于 workspace 内的路径；私有 `.agent` 数据不可被 Agent 工具读取。
 - 普通开发操作保持低打扰，已有用户改动、敏感文件和高影响命令需要确认，明确危险的操作直接拒绝。
+- 命令输出先写入临时文件，超长结果流式保存并按范围读取；超时会终止普通子进程树，Agent API Key 不传给命令进程。
 - 命令前后使用增量 workspace snapshot 检测外部变化；未变化文件复用已有 digest。
 - 内置噪声、Git 项目的根 `.gitignore` 和可选 `.agentignore` 可排除可再生产物；Git 已跟踪文件不会被项目模式隐藏。
 - 验证同时绑定 revision 与 workspace fingerprint，final 前会再次核对当前代码状态。
+- Session 记录创建或确认时的 Git HEAD；恢复到不同代码基线时要求用户确认。
 - Session、trajectory、Checkpoint 和截断命令全文保存在 workspace 的私有 `.agent/` 目录。
 
 更完整的状态语义、安全边界和设计取舍见 [`DESIGN.md`](DESIGN.md)。
@@ -116,16 +157,24 @@ python -m unittest discover -s tests -v
 python -m compileall -q .
 ```
 
-95 个测试覆盖 Agent Loop、tool-call 解析、上下文裁剪、权限、Checkpoint、Session、陈旧写保护、增量 workspace snapshot、长输出恢复、验证门禁和终止条件。
+169 个测试覆盖 Agent Loop、tool-call/finish-reason 协议、失败修复进度、Planner Evidence、终端与 GUI presenter、Evidence Report、任务级恢复、工作区切换与历史数据、用户停止、验证范围、真实 Diff/行数统计、请求预算、可分页 observation、原子编辑、多语言代码概览、权限、Checkpoint、Session、陈旧写保护、增量 workspace snapshot、命令进程树与长输出恢复、验证门禁和终止条件。
 
-`evals/` 提供 8 个隔离的代码修复任务。Harness 会保护测试文件、运行固定 verifier，并记录成功、首次验证、失败恢复、耗时、Token 和工具调用：
+`evals/` 提供 8 个隔离的代码修复任务。Harness 会保护可见测试，Agent 退出后再在独立目录运行 hidden grader，并记录成功、错误完成、首次验证、失败恢复、`NO_PROGRESS`、耗时、Token、模型与工具调用。`--repeat` 支持重复运行预先选定的任务：
 
 ```powershell
 python .\evals\run_eval.py --dry-run
 python .\evals\run_eval.py
+python .\evals\run_eval.py --case percentage-pricing --repeat 3
 ```
 
-评测结果写入已忽略的 `evals/results/`。
+评测结果写入已忽略的 `evals/results/`。公开结果使用冻结的模型、数据集、选题规则和预算，并保留所有失败或提前停止的任务：
+
+| Run | Result | Scope |
+| --- | ---: | --- |
+| Local hidden repair suite | **7/8 (87.5%)** | 8 个隔离修复任务，Agent 退出后运行 hidden grader |
+| BigCodeBench Instruct | **12/30 (40.0%)** | 固定标准库子集，官方远程 evaluator，Pass@1 |
+
+完整配置、任务级结果和解释见 [`evals/BENCHMARK_RESULTS.md`](evals/BENCHMARK_RESULTS.md)，冻结规则见 [`evals/BENCHMARK_PROTOCOL.md`](evals/BENCHMARK_PROTOCOL.md)。BigCodeBench 数字是确定性的 30 题 Pilot，不是完整排行榜成绩。
 
 ## Project layout
 
@@ -133,9 +182,15 @@ python .\evals\run_eval.py
 agent.py                Agent Loop、tool-call 解析与 CLI
 llm.py                  OpenAI-compatible 模型请求
 ctx.py / state.py       有界上下文与 RuntimeState
+planner.py              可恢复的轻量任务计划
+changes.py / ui.py      真实文件变化摘要与终端 renderer
+gui.py / gui_presenter.py  可选桌面窗口与纯事件投影
+gui_data.py             工作区、最近项目与只读文件数据适配
+evidence_report.py      Runtime Evidence Report
 tools.py                工具 schema、registry 与 dispatcher
 workspace_state.py      workspace snapshot 与陈旧写保护
-command_runtime.py      命令执行、超时和长输出存储
+verification.py         显式全量要求与常见 verifier 范围识别
+command_runtime.py      命令进程树、超时和流式输出存储
 permissions.py          ALLOW / ASK / DENY 权限策略
 checkpoint.py           文件 before-image 与安全恢复
 session.py / log.py     Session 与 trajectory
@@ -148,5 +203,8 @@ DESIGN.md               设计说明与实现边界
 ## Limitations
 
 - Shell 以 workspace 为当前目录，但不是操作系统级沙箱。
-- Repo Map 当前只分析 Python；其他语言仍可使用 glob、搜索、读取和项目命令。
-- 模型请求当前为非流式，CLI 不提供完整 TUI。
+- 非 Python Repo Map 使用保守的声明匹配而非完整语法树，结果只用于定位，修改前仍需读取源码。
+- 模型请求当前为非流式；Stop 会立即让 Runtime 放弃等待并忽略迟到响应，但底层 HTTP 请求线程可能继续到 provider timeout。
+- 桌面 GUI 的文件预览是只读的，不提供 IDE 编辑器、Settings 页面或 Git 操作面板。
+- 未配置精确 final verifier 时，全量范围识别采用保守的常见命令规则；无法确认范围的命令不会被当作全量验证。
+- 当前公开的 BigCodeBench 结果是固定 30 题 Pilot；它用于可重复比较版本，不代表完整排行榜成绩。

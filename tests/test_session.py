@@ -28,7 +28,12 @@ class TestSession(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_round_trip_preserves_messages_but_resets_process_local_safety(self):
-        store = SessionStore.create(self.tmpdir, "model-a", "first task")
+        store = SessionStore.create(
+            self.tmpdir,
+            "model-a",
+            "first task",
+            git_head="base-abc",
+        )
         st = State(
             rev=2,
             ok_rev=2,
@@ -38,6 +43,13 @@ class TestSession(unittest.TestCase):
             out_tok=4,
             task_in_tok=6,
             task_out_tok=2,
+            task_model_calls=3,
+            task_tool_calls=5,
+            check_attempts=[{"step": 2, "rc": 1, "progress": "failed"}],
+            task_evidence=[{"step": 1, "kind": "tool", "tool": "read_file"}],
+            planner_task="follow-up task",
+            requires_full_verification=True,
+            verified_scope="targeted",
             session_id=store.session_id,
         )
         tool_group = [
@@ -63,11 +75,23 @@ class TestSession(unittest.TestCase):
         self.assertEqual(loaded.ctx.groups[-1][0]["content"], "done")
         self.assertEqual((restored.rev, restored.changed, restored.files), (2, True, {"a.py"}))
         self.assertEqual(restored.ok_rev, -1)
+        self.assertTrue(restored.requires_full_verification)
+        self.assertEqual(restored.verified_scope, "targeted")
+        self.assertFalse(restored.verification_current())
         self.assertEqual(restored.task_tokens, 8)
+        self.assertEqual(restored.task_model_calls, 3)
+        self.assertEqual(restored.task_tool_calls, 5)
+        self.assertEqual(len(restored.check_attempts), 1)
+        self.assertEqual(restored.planner_task, "follow-up task")
         self.assertEqual(restored.errs, 0)
         self.assertEqual(restored.repetition.count, 0)
         self.assertFalse(restored.permissions.allow_clean_edits)
         self.assertEqual(loaded.previous_verified_revision, 2)
+        self.assertEqual(loaded.expected_git_head, "base-abc")
+
+        reopened.record_git_base("base-def", "base-abc")
+        reloaded = reopened.load("fresh system")
+        self.assertEqual(reloaded.expected_git_head, "base-def")
 
     def test_incomplete_final_jsonl_line_is_ignored(self):
         store = SessionStore.create(self.tmpdir, "model-a", "task")
@@ -97,6 +121,34 @@ class TestSession(unittest.TestCase):
         self.assertTrue(st.changed)
         self.assertEqual(st.files, {"a.py"})
         self.assertEqual(st.ok_rev, -1)
+
+    def test_history_summary_uses_persisted_runtime_outcome(self):
+        store = SessionStore.create(self.tmpdir, "model-a", "repair parser")
+        store.record_outcome(
+            text="Fixed and verified.",
+            completed=True,
+            changes=[{"path": "parser.py", "kind": "modified", "additions": 2, "deletions": 1}],
+            verification={"current": True, "adequate": True},
+            steps=7,
+            elapsed_seconds=1.5,
+            report={"metrics": {"model_calls": 4}, "outcome": {"termination_reason": "completed"}},
+        )
+
+        summaries = SessionStore.summaries(self.tmpdir)
+
+        self.assertEqual(summaries[0]["status"], "verified")
+        self.assertEqual(summaries[0]["task"], "repair parser")
+        self.assertEqual(summaries[0]["outcome"]["steps"], 7)
+        self.assertEqual(summaries[0]["outcome"]["report"]["metrics"]["model_calls"], 4)
+
+    def test_corrupt_history_entry_is_skipped_without_breaking_other_sessions(self):
+        valid = SessionStore.create(self.tmpdir, "model-a", "valid task")
+        corrupt = SessionStore.directory(self.tmpdir) / "session-99999999-999999-bad.jsonl"
+        corrupt.write_text("not json\nsecond bad line\n", encoding="utf-8")
+
+        summaries = SessionStore.summaries(self.tmpdir)
+
+        self.assertEqual([item["id"] for item in summaries], [valid.session_id])
 
 
 if __name__ == "__main__":

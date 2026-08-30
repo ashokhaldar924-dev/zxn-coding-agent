@@ -8,7 +8,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
-from permissions import Decision, PermissionManager
+from permissions import Decision, PermissionManager, _requires_exact_session_approval
 
 
 class TestPermissionManager(unittest.TestCase):
@@ -64,6 +64,19 @@ class TestPermissionManager(unittest.TestCase):
         self.assertEqual(second.decision, Decision.ALLOW)
         ask.assert_called_once()
 
+    def test_injected_answerer_reuses_existing_permission_semantics(self):
+        prompts = []
+        self.permissions.answerer = lambda prompt: prompts.append(prompt) or "2"
+
+        first = self.permissions.authorize_command("mytool inspect a.py")
+        second = self.permissions.authorize_command("mytool inspect b.py")
+
+        self.assertEqual(first.decision, Decision.ALLOW)
+        self.assertTrue(first.remembered)
+        self.assertEqual(second.decision, Decision.ALLOW)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("mytool inspect a.py", prompts[0])
+
     def test_different_command_still_asks(self):
         with mock.patch("builtins.input", side_effect=["2", "3"]) as ask:
             self.permissions.authorize_command("mytool inspect a.py")
@@ -71,6 +84,37 @@ class TestPermissionManager(unittest.TestCase):
         self.assertEqual(second.decision, Decision.DENY)
         self.assertTrue(second.user_rejected)
         self.assertEqual(ask.call_count, 2)
+
+    def test_inline_interpreters_only_remember_the_exact_command(self):
+        first_cmd = 'python -c "print(1)"'
+        different_cmd = 'python -c "print(2)"'
+        with mock.patch("builtins.input", return_value="2") as ask:
+            first = self.permissions.authorize_command(first_cmd)
+
+        repeated = self.permissions.decide_command(first_cmd)
+        different = self.permissions.decide_command(different_cmd)
+
+        self.assertEqual(first.decision, Decision.ALLOW)
+        self.assertTrue(first.remembered)
+        self.assertEqual(repeated.decision, Decision.ALLOW)
+        self.assertEqual(different.decision, Decision.ASK)
+        self.assertNotIn("python -c", self.permissions.allowed_command_scopes)
+        self.assertIn(first_cmd, self.permissions.allowed_exact_commands)
+        ask.assert_called_once()
+
+    def test_shell_and_language_eval_entrypoints_require_exact_approval(self):
+        commands = [
+            'bash -c "echo one"',
+            'sh -c "echo one"',
+            'node -e "console.log(1)"',
+            'ruby -e "puts 1"',
+            'perl -e "print 1"',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue(
+                    _requires_exact_session_approval(command)
+                )
 
     def test_dirty_file_needs_specific_session_approval(self):
         self.permissions.allow_clean_edits = True

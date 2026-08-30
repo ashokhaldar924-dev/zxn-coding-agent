@@ -6,6 +6,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -41,10 +43,30 @@ class TestTools(unittest.TestCase):
         config.CMD_TIMEOUT = self.old_timeout
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
+    def test_user_stop_terminates_running_command(self):
+        cancel = threading.Event()
+        st = State(cancel_event=cancel)
+        st.initialize_workspace_tracking(self.tmpdir)
+        timer = threading.Timer(0.15, cancel.set)
+        command = f'"{sys.executable}" -c "import time; time.sleep(30)"'
+
+        timer.start()
+        started = time.monotonic()
+        try:
+            result = tools.run_user_command(command, timeout=10, st=st)
+        finally:
+            timer.cancel()
+
+        self.assertTrue(result.cancelled)
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.block_kind, "user_stopped")
+        self.assertIn("cancelled by user", result.text.lower())
+        self.assertLess(time.monotonic() - started, 5)
+
     def run_tool(self, name, args):
         return tools.run_tool(name, args, self.st)
 
-    def test_registry_has_exactly_ten_tools(self):
+    def test_registry_has_exactly_twelve_tools(self):
         self.assertEqual(
             list(tools.REG),
             [
@@ -52,10 +74,12 @@ class TestTools(unittest.TestCase):
                 "read_command_output",
                 "write_file",
                 "edit_file",
+                "multi_edit",
                 "list_dir",
                 "glob_files",
                 "repo_map",
                 "search_text",
+                "update_plan",
                 "run_command",
                 "check_command",
             ],
@@ -104,8 +128,23 @@ class TestTools(unittest.TestCase):
         self.assertIn("capped at 200", capped.text)
         self.assertNotIn("201 |", capped.text)
 
+    def test_read_truncates_one_huge_line_without_losing_continuation_metadata(self):
+        Path(self.tmpdir, "minified.js").write_text(
+            "const payload = '" + "A" * 8_000 + "'; // tail-marker\nnext();\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_tool("read_file", {"path": "minified.js"})
+
+        self.assertTrue(result.ok)
+        self.assertIn("line truncated: 8034 chars", result.text)
+        self.assertIn("tail-marker", result.text)
+        self.assertIn("2 | next();", result.text)
+        self.assertLessEqual(len(result.text), config.MAX_TOOL_CHARS)
+
     def test_write_create_noop_and_revision(self):
-        with contextlib.redirect_stdout(io.StringIO()):
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
             first = self.run_tool("write_file", {"path": "sub/a.txt", "content": "one\n"})
             noop = self.run_tool("write_file", {"path": "sub/a.txt", "content": "one\n"})
         self.assertTrue(first.ok)
@@ -114,6 +153,11 @@ class TestTools(unittest.TestCase):
         self.assertEqual(self.st.files, {"sub/a.txt"})
         self.assertIn("No change", noop.text)
         self.assertEqual(self.st.rev, 1)
+        self.assertEqual(
+            (first.file_changes[0].kind, first.file_changes[0].additions),
+            ("added", 1),
+        )
+        self.assertNotIn("+one", stream.getvalue())
 
     def test_write_diff_preview_and_rejection(self):
         config.REQUIRE_CONFIRMATION = True
@@ -143,6 +187,54 @@ class TestTools(unittest.TestCase):
         self.assertTrue(one.ok)
         self.assertEqual(Path(self.tmpdir, "a.txt").read_text(encoding="utf-8"), "alpha\ngamma\n")
         self.assertEqual(self.st.rev, 1)
+
+    def test_multi_edit_is_atomic_exact_and_preserves_bom_and_crlf(self):
+        path = Path(self.tmpdir, "batch.py")
+        path.write_bytes(tools.UTF8_BOM + b"one\r\ntwo\r\n")
+        failed = self.run_tool(
+            "multi_edit",
+            {
+                "path": "batch.py",
+                "edits": [
+                    {"old": "one", "new": "first"},
+                    {"old": "missing", "new": "second"},
+                ],
+            },
+        )
+        self.assertFalse(failed.ok)
+        self.assertEqual(path.read_bytes(), tools.UTF8_BOM + b"one\r\ntwo\r\n")
+        self.assertEqual(self.st.rev, 0)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            changed = self.run_tool(
+                "multi_edit",
+                {
+                    "path": "batch.py",
+                    "edits": [
+                        {"old": "one", "new": "first"},
+                        {"old": "two", "new": "second"},
+                    ],
+                },
+            )
+        self.assertTrue(changed.ok)
+        self.assertEqual(path.read_bytes(), tools.UTF8_BOM + b"first\r\nsecond\r\n")
+        self.assertEqual(self.st.rev, 1)
+        self.assertIn("2 exact edits", changed.text)
+
+    def test_atomic_replace_failure_preserves_original_file(self):
+        path = Path(self.tmpdir, "atomic.txt")
+        path.write_text("old\n", encoding="utf-8")
+        with mock.patch.object(
+            tools.os, "replace", side_effect=OSError("locked")
+        ), contextlib.redirect_stdout(io.StringIO()):
+            result = self.run_tool(
+                "edit_file",
+                {"path": "atomic.txt", "old": "old", "new": "new"},
+            )
+        self.assertFalse(result.ok)
+        self.assertIn("locked", result.text)
+        self.assertEqual(path.read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(self.st.rev, 0)
 
     def test_external_edit_is_not_overwritten_until_the_file_is_read_again(self):
         path = Path(self.tmpdir, "shared.txt")
@@ -301,6 +393,28 @@ class TestTools(unittest.TestCase):
         self.assertIn("Found 40 matches; showing first 30", result.text)
         self.assertEqual(sum(": needle " in line for line in result.text.splitlines()), 30)
 
+    def test_list_search_and_glob_pages_have_explicit_next_offsets(self):
+        for index in range(5):
+            Path(self.tmpdir, f"page-{index}.txt").write_text(
+                f"needle {index}\n", encoding="utf-8"
+            )
+
+        listed = self.run_tool("list_dir", {"offset": 1, "limit": 2})
+        searched = self.run_tool(
+            "search_text", {"query": "needle", "offset": 2, "limit": 2}
+        )
+        globbed = self.run_tool(
+            "glob_files", {"pattern": "*.txt", "offset": 3, "limit": 1}
+        )
+
+        self.assertIn("page-1.txt", listed.text)
+        self.assertNotIn("page-0.txt", listed.text)
+        self.assertIn("Found 5 entries; showing 2-3. next offset: 3.", listed.text)
+        self.assertIn("page-2.txt:1: needle 2", searched.text)
+        self.assertIn("Found 5 matches; showing 3-4. next offset: 4.", searched.text)
+        self.assertIn("page-3.txt", globbed.text)
+        self.assertIn("Found 5 files; showing 4-4. next offset: 4.", globbed.text)
+
     def test_search_regex_and_invalid_pattern(self):
         Path(self.tmpdir, "code.py").write_text(
             "class FirstHandler:\n    pass\nclass Other:\n    pass\n",
@@ -350,6 +464,39 @@ class TestTools(unittest.TestCase):
         self.assertIn("L4 class Worker(Base)", result.text)
         self.assertIn("L5 async def run(self, item)", result.text)
         self.assertIn("could not be parsed", result.text)
+
+    def test_repo_map_extracts_ranked_multilanguage_declarations_with_lines(self):
+        Path(self.tmpdir, "index.ts").write_text(
+            "export interface User { id: number }\n"
+            "export async function loadUser(id: number) { return id }\n",
+            encoding="utf-8",
+        )
+        Path(self.tmpdir, "main.go").write_text(
+            "package main\nfunc Run() {}\n",
+            encoding="utf-8",
+        )
+        Path(self.tmpdir, "lib.rs").write_text(
+            "pub struct Store {}\npub fn open() {}\n",
+            encoding="utf-8",
+        )
+        Path(self.tmpdir, "Main.java").write_text(
+            "public class Main {}\n",
+            encoding="utf-8",
+        )
+        Path(self.tmpdir, "worker.cpp").write_text(
+            "class Worker {};\nint execute() { return 0; }\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_tool("repo_map", {"path": "."})
+
+        self.assertTrue(result.ok)
+        self.assertIn("Languages: C++, Go, Java, Rust, TypeScript", result.text)
+        self.assertIn("L1 export interface User", result.text)
+        self.assertIn("L2 func Run()", result.text)
+        self.assertIn("L1 pub struct Store", result.text)
+        self.assertIn("L1 public class Main", result.text)
+        self.assertIn("L2 int execute()", result.text)
 
     def test_repo_map_does_not_follow_file_symlinks_outside_workspace(self):
         outside_dir = tempfile.mkdtemp()
@@ -401,11 +548,64 @@ class TestTools(unittest.TestCase):
         self.assertIsNone(result.rc)
         self.assertIn("timed out", result.text)
 
+    def test_timeout_terminates_an_ordinary_child_process_tree(self):
+        Path(self.tmpdir, "child.py").write_text(
+            "import time\n"
+            "from pathlib import Path\n"
+            "time.sleep(1)\n"
+            "Path('survivor.txt').write_text('alive', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        Path(self.tmpdir, "parent.py").write_text(
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, 'child.py'])\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_tool(
+            "run_command",
+            {"cmd": f'"{sys.executable}" parent.py', "timeout": 0.5},
+        )
+        time.sleep(1.2)
+
+        self.assertFalse(result.ok)
+        self.assertIn("timed out", result.text)
+        self.assertFalse(Path(self.tmpdir, "survivor.txt").exists())
+
+    def test_command_does_not_inherit_the_agent_api_key(self):
+        old_key = os.environ.get("AGENT_API_KEY")
+        os.environ["AGENT_API_KEY"] = "model-credential-must-not-reach-command"
+        try:
+            result = self.run_tool(
+                "run_command",
+                {
+                    "cmd": (
+                        f'"{sys.executable}" -c "import os; '
+                        "print(os.getenv('AGENT_API_KEY', 'MISSING'))\""
+                    )
+                },
+            )
+        finally:
+            if old_key is None:
+                os.environ.pop("AGENT_API_KEY", None)
+            else:
+                os.environ["AGENT_API_KEY"] = old_key
+
+        self.assertEqual(result.rc, 0)
+        self.assertIn("MISSING", result.text)
+        self.assertNotIn("[REDACTED]", result.text)
+
     def test_long_command_output_is_saved_and_can_be_read_by_range(self):
         config.MAX_TOOL_CHARS = 180
         result = self.run_tool(
             "run_command",
-            {"cmd": f'"{sys.executable}" -c "print(\'A\'*300); print(\'TAIL\')"'},
+            {
+                "cmd": (
+                    f'"{sys.executable}" -c "print(\'A\'*1000000, end=\'\'); '
+                    "print('TAIL')\""
+                )
+            },
         )
         self.assertIn("output truncated", result.text)
         self.assertIn("TAIL", result.text)
@@ -419,7 +619,7 @@ class TestTools(unittest.TestCase):
             result.output_ref,
         )
         self.assertTrue(saved.is_file())
-        self.assertIn("A" * 300, saved.read_text(encoding="utf-8"))
+        self.assertGreater(saved.stat().st_size, 1_000_000)
 
         reread = self.run_tool(
             "read_command_output",
@@ -428,6 +628,16 @@ class TestTools(unittest.TestCase):
         self.assertTrue(reread.ok)
         self.assertIn(result.output_ref, reread.text)
         self.assertIn("exit code: 0", reread.text)
+        tail = self.run_tool(
+            "read_command_output",
+            {
+                "output_id": result.output_ref,
+                "offset": result.output_chars - 20,
+                "limit": 20,
+            },
+        )
+        self.assertIn("TAIL", tail.text)
+        self.assertIn("end of saved output", tail.text)
 
         old_key = os.environ.get("AGENT_API_KEY")
         os.environ["AGENT_API_KEY"] = "command-output-test-secret"

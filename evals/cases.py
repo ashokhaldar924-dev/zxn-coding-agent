@@ -34,6 +34,18 @@ CASES = [
                         self.assertEqual(final_price(50, 100), 0.0)
             """),
         },
+        "hidden_files": {
+            "tests/test_hidden_pricing.py": _s("""
+                import unittest
+                from pricing import final_price
+
+                class HiddenPricingTests(unittest.TestCase):
+                    def test_fractional_percentage_and_invalid_range(self):
+                        self.assertEqual(final_price(80, 12.5), 70.0)
+                        with self.assertRaises(ValueError):
+                            final_price(10, 101)
+            """),
+        },
     },
     {
         "name": "half-open-intervals",
@@ -56,6 +68,18 @@ CASES = [
                         self.assertFalse(overlaps((1, 3), (3, 5)))
                     def test_real_overlap(self):
                         self.assertTrue(overlaps((1, 4), (3, 5)))
+            """),
+        },
+        "hidden_files": {
+            "tests/test_hidden_intervals.py": _s("""
+                import unittest
+                from intervals import overlaps
+
+                class HiddenIntervalTests(unittest.TestCase):
+                    def test_containment_and_disjoint_ranges(self):
+                        self.assertTrue(overlaps((2, 8), (3, 4)))
+                        self.assertFalse(overlaps((1, 2), (5, 9)))
+                        self.assertFalse(overlaps((3, 3), (3, 5)))
             """),
         },
     },
@@ -89,6 +113,19 @@ CASES = [
                             Inventory(3).reserve(4)
             """),
         },
+        "hidden_files": {
+            "tests/test_hidden_inventory.py": _s("""
+                import unittest
+                from inventory import Inventory
+
+                class HiddenInventoryTests(unittest.TestCase):
+                    def test_exact_reservation_exhausts_stock(self):
+                        item = Inventory(1)
+                        self.assertEqual(item.reserve(1), 0)
+                        with self.assertRaises(ValueError):
+                            item.reserve(1)
+            """),
+        },
     },
     {
         "name": "config-none-merge",
@@ -109,6 +146,17 @@ CASES = [
                         self.assertEqual(merge_config({"timeout": 30}, {"timeout": None}), {"timeout": 30})
                     def test_real_override_is_applied(self):
                         self.assertEqual(merge_config({"timeout": 30}, {"timeout": 5}), {"timeout": 5})
+            """),
+        },
+        "hidden_files": {
+            "tests/test_hidden_config_merge.py": _s("""
+                import unittest
+                from config_merge import merge_config
+
+                class HiddenConfigMergeTests(unittest.TestCase):
+                    def test_none_is_ignored_without_losing_other_overrides(self):
+                        result = merge_config({"timeout": 30, "retries": 2}, {"timeout": None, "retries": 5})
+                        self.assertEqual(result, {"timeout": 30, "retries": 5})
             """),
         },
     },
@@ -132,6 +180,18 @@ CASES = [
                         self.assertEqual(page_slice(list(range(7)), 1, 3), [0, 1, 2])
                     def test_second_page(self):
                         self.assertEqual(page_slice(list(range(7)), 2, 3), [3, 4, 5])
+            """),
+        },
+        "hidden_files": {
+            "tests/test_hidden_pagination.py": _s("""
+                import unittest
+                from pagination import page_slice
+
+                class HiddenPaginationTests(unittest.TestCase):
+                    def test_partial_last_page_and_invalid_page(self):
+                        self.assertEqual(page_slice(list(range(7)), 3, 3), [6])
+                        with self.assertRaises(ValueError):
+                            page_slice([], 0, 3)
             """),
         },
     },
@@ -168,6 +228,22 @@ CASES = [
                         self.assertIsNone(cache.get("k"))
             """),
         },
+        "hidden_files": {
+            "tests/test_hidden_cache.py": _s("""
+                import unittest
+                from cache import Cache
+
+                class HiddenCacheTests(unittest.TestCase):
+                    def test_value_remains_available_until_exact_expiry(self):
+                        now = [0]
+                        cache = Cache(lambda: now[0])
+                        cache.put("x", 3, 2)
+                        now[0] = 1
+                        self.assertEqual(cache.get("x"), 3)
+                        now[0] = 2
+                        self.assertIsNone(cache.get("x"))
+            """),
+        },
     },
     {
         "name": "slug-normalization",
@@ -186,6 +262,16 @@ CASES = [
                         self.assertEqual(slugify(" Hello,   World! "), "hello-world")
                     def test_already_clean(self):
                         self.assertEqual(slugify("agent-design"), "agent-design")
+            """),
+        },
+        "hidden_files": {
+            "tests/test_hidden_slug.py": _s("""
+                import unittest
+                from slug import slugify
+
+                class HiddenSlugTests(unittest.TestCase):
+                    def test_mixed_punctuation_does_not_leave_separators(self):
+                        self.assertEqual(slugify("API:  Design__Guide"), "api-design-guide")
             """),
         },
     },
@@ -208,6 +294,18 @@ CASES = [
                         self.assertEqual(retry_delays(4, base=2), [2, 4, 8])
                     def test_one_attempt_has_no_retry_delay(self):
                         self.assertEqual(retry_delays(1), [])
+            """),
+        },
+        "hidden_files": {
+            "tests/test_hidden_retry.py": _s("""
+                import unittest
+                from retry import retry_delays
+
+                class HiddenRetryTests(unittest.TestCase):
+                    def test_two_attempts_have_one_delay_and_zero_is_invalid(self):
+                        self.assertEqual(retry_delays(2, base=3), [3])
+                        with self.assertRaises(ValueError):
+                            retry_delays(0)
             """),
         },
     },

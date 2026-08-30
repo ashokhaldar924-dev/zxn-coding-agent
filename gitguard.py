@@ -11,6 +11,7 @@ from pathlib import Path
 class GitGuard:
     repo_root: Path | None = None
     initial_dirty: set[Path] = field(default_factory=set)
+    head: str | None = None
 
     @property
     def active(self) -> bool:
@@ -47,6 +48,19 @@ class GitGuard:
             if root_result.returncode != 0:
                 return cls()
             repo_root = Path(root_result.stdout.strip()).resolve()
+            try:
+                head_result = subprocess.run(
+                    ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=5,
+                    check=False,
+                )
+                head = head_result.stdout.strip() if head_result.returncode == 0 else None
+            except (OSError, subprocess.SubprocessError):
+                head = None
             status_result = subprocess.run(
                 ["git", "-C", str(repo_root), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
                 capture_output=True,
@@ -57,7 +71,7 @@ class GitGuard:
                 check=False,
             )
             if status_result.returncode != 0:
-                return cls(repo_root=repo_root)
+                return cls(repo_root=repo_root, head=head)
         except (OSError, subprocess.SubprocessError):
             return cls()
 
@@ -76,4 +90,4 @@ class GitGuard:
             index += 1
             if "R" in status or "C" in status:
                 index += 1
-        return cls(repo_root=repo_root, initial_dirty=dirty)
+        return cls(repo_root=repo_root, initial_dirty=dirty, head=head)

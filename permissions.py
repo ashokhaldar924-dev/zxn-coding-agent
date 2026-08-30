@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -165,13 +166,38 @@ def _protected_edit_reason(path: str) -> str | None:
     return None
 
 
+def _command_tokens(cmd: str) -> list[str]:
+    try:
+        return [token.strip('"\'') for token in shlex.split(cmd, posix=False)]
+    except ValueError:
+        return []
+
+
+def _requires_exact_session_approval(cmd: str) -> bool:
+    """Identify interpreter entry points whose family can execute arbitrary code."""
+
+    tokens = _command_tokens(cmd)
+    if len(tokens) < 2:
+        return False
+    executable = Path(tokens[0]).name.lower()
+    if executable.endswith((".exe", ".cmd")):
+        executable = executable.rsplit(".", 1)[0]
+    option = tokens[1].lower()
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
+        return option in {"-c", "-"}
+    if executable in {"bash", "sh", "zsh"}:
+        return option == "-c"
+    if executable in {"node", "ruby", "perl"}:
+        return option == "-e"
+    if executable in {"powershell", "pwsh"}:
+        return option in {"-command", "-encodedcommand"}
+    return executable == "cmd" and option == "/c"
+
+
 def _command_scope(cmd: str) -> str:
     """Return a small, visible command family for session-scoped approval."""
 
-    try:
-        tokens = [token.strip('"\'') for token in shlex.split(cmd, posix=False)]
-    except ValueError:
-        return cmd.strip()
+    tokens = _command_tokens(cmd)
     if not tokens:
         return cmd.strip()
     executable = Path(tokens[0]).name.lower()
@@ -192,12 +218,18 @@ class PermissionManager:
 
     allow_clean_edits: bool = False
     allowed_command_scopes: set[str] = field(default_factory=set)
+    allowed_exact_commands: set[str] = field(default_factory=set)
     denied_command_scopes: set[str] = field(default_factory=set)
     allowed_dirty_files: set[str] = field(default_factory=set)
     allowed_protected_files: set[str] = field(default_factory=set)
+    answerer: Callable[[str], str] | None = field(default=None, repr=False, compare=False)
 
-    @staticmethod
-    def _answer(prompt: str) -> str:
+    def _answer(self, prompt: str) -> str:
+        if self.answerer is not None:
+            try:
+                return self.answerer(prompt).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return ""
         try:
             return input(prompt).strip().lower()
         except EOFError:
@@ -318,6 +350,8 @@ class PermissionManager:
             and _is_common_verifier(normalized)
         ):
             return PermissionResult(Decision.ALLOW, "recognized local verification command")
+        if normalized in self.allowed_exact_commands:
+            return PermissionResult(Decision.ALLOW, "exact command approved for this session")
         if scope in self.allowed_command_scopes:
             return PermissionResult(Decision.ALLOW, f"command family approved for this session: {scope}")
         return PermissionResult(Decision.ASK, "unrecognized command requires approval")
@@ -339,10 +373,12 @@ class PermissionManager:
 
         normalized = cmd.strip()
         scope = _command_scope(normalized)
+        exact_only = _requires_exact_session_approval(normalized)
         critical = _always_ask_reason(normalized) is not None
         if critical:
             answer = self._answer(
                 f"High-impact command: {decision.reason}.\n"
+                f"\n{normalized}\n\n"
                 "  [1] Allow once\n"
                 "  [2] Deny once\n"
                 f"  [3] Deny this command family for the session: {scope}\n"
@@ -364,18 +400,31 @@ class PermissionManager:
                 user_rejected=True,
             )
 
+        remembered_target = (
+            f"this exact command for the session: {normalized}"
+            if exact_only
+            else f"this command family for the session: {scope}"
+        )
         answer = self._answer(
             f"Command requires approval: {decision.reason}.\n"
+            f"\n{normalized}\n\n"
             "  [1] Allow once\n"
-            f"  [2] Allow this command family for the session: {scope}\n"
+            f"  [2] Allow {remembered_target}\n"
             "  [3] Deny\n"
             "Choose [1/2/3]: "
         )
         if answer in {"2", "a", "always"}:
-            self.allowed_command_scopes.add(scope)
+            if exact_only:
+                self.allowed_exact_commands.add(normalized)
+            else:
+                self.allowed_command_scopes.add(scope)
             return PermissionResult(
                 Decision.ALLOW,
-                f"user approved command family for the session: {scope}",
+                (
+                    f"user approved exact command for the session: {normalized}"
+                    if exact_only
+                    else f"user approved command family for the session: {scope}"
+                ),
                 remembered=True,
             )
         if answer in {"1", "y", "yes"}:
