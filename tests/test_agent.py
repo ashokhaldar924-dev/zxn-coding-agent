@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import os
 import shutil
 import sys
 import tempfile
@@ -13,13 +12,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import agent
-import config
-from ctx import Ctx
-from log import NullLog
-from state import State
+from zxn_agent import agent, config
+from zxn_agent.ctx import Ctx
+from zxn_agent.log import NullLog
+from zxn_agent.state import State
 
 
 def call(call_id: str, name: str, args) -> dict:
@@ -603,9 +599,9 @@ class TestCLI(unittest.TestCase):
         store.load.return_value = mock.Mock(expected_git_head="old-head")
         guard = agent.GitGuard(head="new-head")
         with (
-            mock.patch("agent._scan_workspace", return_value=(guard, [], None)),
-            mock.patch("agent.SessionStore.open", return_value=store),
-            mock.patch("agent._confirm_stale_git_base", return_value=False) as confirm,
+            mock.patch("zxn_agent.agent._scan_workspace", return_value=(guard, [], None)),
+            mock.patch("zxn_agent.agent.SessionStore.open", return_value=store),
+            mock.patch("zxn_agent.agent._confirm_stale_git_base", return_value=False) as confirm,
             self.assertRaises(agent.SessionError),
         ):
             agent._resume_active("latest", NullLog())
@@ -614,8 +610,8 @@ class TestCLI(unittest.TestCase):
 
     def test_missing_configuration_is_reported_without_traceback(self):
         with (
-            mock.patch("agent._parser") as parser,
-            mock.patch("config.get_api_key", side_effect=RuntimeError("missing key")),
+            mock.patch("zxn_agent.agent._parser") as parser,
+            mock.patch("zxn_agent.config.get_api_key", side_effect=RuntimeError("missing key")),
             contextlib.redirect_stdout(io.StringIO()) as output,
         ):
             parser.return_value.parse_args.return_value = mock.Mock(

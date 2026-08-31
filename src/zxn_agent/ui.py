@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from changes import FileChange
+from .changes import FileChange
 
 COLORS = {
     "cyan": "\033[36m",

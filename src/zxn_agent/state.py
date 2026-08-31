@@ -7,13 +7,13 @@ from dataclasses import dataclass, field
 from threading import Event
 from typing import Any
 
-import config
-from changes import FileChange
-from gitguard import GitGuard
-from guards import RepetitionGuard
-from permissions import PermissionManager
-from planner import PlanState
-from verification import (
+from . import config
+from .changes import FileChange
+from .gitguard import GitGuard
+from .guards import RepetitionGuard
+from .permissions import PermissionManager
+from .planner import PlanState
+from .verification import (
     FULL_SUITE,
     PROGRESS_FAILED,
     PROGRESS_NO_PROGRESS,
@@ -22,7 +22,7 @@ from verification import (
     PROGRESS_WARNING,
     failure_fingerprint,
 )
-from workspace_state import WorkspaceDelta, WorkspaceSnapshot, WorkspaceTracker
+from .workspace_state import WorkspaceDelta, WorkspaceSnapshot, WorkspaceTracker
 
 
 @dataclass

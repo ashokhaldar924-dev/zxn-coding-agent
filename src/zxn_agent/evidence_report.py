@@ -6,8 +6,8 @@ import json
 from datetime import datetime
 from typing import Any
 
-from changes import FileChange
-from state import State
+from .changes import FileChange
+from .state import State
 
 REPORT_VERSION = 1
 

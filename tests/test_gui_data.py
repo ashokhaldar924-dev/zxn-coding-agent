@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import os
 import shutil
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from changes import unified_byte_diff
-from gui_data import (
+from zxn_agent.changes import unified_byte_diff
+from zxn_agent.gui_data import (
     RecentWorkspaceStore,
     WorkspaceDataError,
     project_files,

@@ -14,14 +14,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-import config
-import ui
-from changes import FileChange, summarize_text_change
-from command_runtime import CommandRunner, read_saved_output_range
-from permissions import Decision
-from planner import PLAN_INVESTIGATION_TOOLS, plan_policy_issue
-from state import State, ToolRes
-from verification import PROGRESS_NO_PROGRESS, PROGRESS_WARNING, verifier_scope
+from . import config, ui
+from .changes import FileChange, summarize_text_change
+from .command_runtime import CommandRunner, read_saved_output_range
+from .permissions import Decision
+from .planner import PLAN_INVESTIGATION_TOOLS, plan_policy_issue
+from .state import State, ToolRes
+from .verification import PROGRESS_NO_PROGRESS, PROGRESS_WARNING, verifier_scope
 
 NOISE_DIRS = {".git", ".agent", "__pycache__", ".pytest_cache", ".venv", "node_modules"}
 MAX_READ_LINES = 200

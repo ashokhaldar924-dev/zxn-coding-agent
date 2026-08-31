@@ -1,20 +1,14 @@
 from __future__ import annotations
 
-import os
 import shutil
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import agent
-import config
-import tools
-from planner import PLANNER_POLICY_PROMPT, PlanState, plan_policy_issue
-from session import SessionStore, restore_state
-from state import State
+from zxn_agent import agent, config, tools
+from zxn_agent.planner import PLANNER_POLICY_PROMPT, PlanState, plan_policy_issue
+from zxn_agent.session import SessionStore, restore_state
+from zxn_agent.state import State
 
 
 class TestPlanner(unittest.TestCase):

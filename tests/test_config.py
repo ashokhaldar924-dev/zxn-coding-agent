@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import config
+from zxn_agent import config
 
 
 class TestPersistentEnvironmentConfig(unittest.TestCase):

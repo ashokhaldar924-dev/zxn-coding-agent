@@ -1,23 +1,19 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from checkpoint import CheckpointManager
-from session import (
+from zxn_agent.checkpoint import CheckpointManager
+from zxn_agent.session import (
     SessionError,
     SessionStore,
     reconcile_checkpoint_state,
     restore_state,
 )
-from state import State
+from zxn_agent.state import State
 
 
 class TestSession(unittest.TestCase):

@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-import os
 import shutil
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import workspace_state
-from workspace_state import WorkspaceTracker
+from zxn_agent import workspace_state
+from zxn_agent.workspace_state import WorkspaceTracker
 
 
 class TestWorkspaceState(unittest.TestCase):
@@ -30,7 +26,7 @@ class TestWorkspaceState(unittest.TestCase):
         tracker = WorkspaceTracker()
 
         with mock.patch(
-            "workspace_state._read_digest",
+            "zxn_agent.workspace_state._read_digest",
             wraps=workspace_state._read_digest,
         ) as read_digest:
             initial = tracker.initialize(self.root)
@@ -91,7 +87,7 @@ class TestWorkspaceState(unittest.TestCase):
         (self.root / "output.log").write_text("noise\n", encoding="utf-8")
 
         with mock.patch(
-            "workspace_state._git_tracked_paths",
+            "zxn_agent.workspace_state._git_tracked_paths",
             return_value=frozenset({".gitignore", "tracked.py"}),
         ):
             snapshot = WorkspaceTracker().initialize(self.root)

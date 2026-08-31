@@ -3,15 +3,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import config
-from ctx import Ctx
-from log import RunLog
+from zxn_agent import config
+from zxn_agent.ctx import Ctx
+from zxn_agent.log import RunLog
 
 
 class TestContext(unittest.TestCase):

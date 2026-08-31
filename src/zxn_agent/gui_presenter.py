@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from changes import FileChange
+from .changes import FileChange
 
 MAX_DETAIL_LINES = 6
 MAX_DETAIL_CHARS = 1_000

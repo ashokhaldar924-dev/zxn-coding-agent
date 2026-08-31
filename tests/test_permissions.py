@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import os
-import sys
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import config
-from permissions import Decision, PermissionManager, _requires_exact_session_approval
+from zxn_agent import config
+from zxn_agent.permissions import (
+    Decision,
+    PermissionManager,
+    _requires_exact_session_approval,
+)
 
 
 class TestPermissionManager(unittest.TestCase):

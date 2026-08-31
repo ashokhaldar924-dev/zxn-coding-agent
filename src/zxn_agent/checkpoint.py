@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from changes import FileChange, FileDiff, summarize_byte_change, unified_byte_diff
+from .changes import FileChange, FileDiff, summarize_byte_change, unified_byte_diff
 
 
 class CheckpointError(RuntimeError):

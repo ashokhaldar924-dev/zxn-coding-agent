@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import os
-import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from changes import FileChange
-from evidence_report import build_evidence_report, report_markdown
-from state import State
+from zxn_agent.changes import FileChange
+from zxn_agent.evidence_report import build_evidence_report, report_markdown
+from zxn_agent.state import State
 
 
 class TestEvidenceReport(unittest.TestCase):

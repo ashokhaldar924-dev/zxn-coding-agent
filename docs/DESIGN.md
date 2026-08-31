@@ -107,7 +107,7 @@
 
 Stop 使用 `State` 中不持久化的 process-local cancellation event。Agent Loop 在模型等待、工具组边界和 final 前检查它；命令执行层轮询同一事件并终止普通子进程树。若 HTTP provider 不支持取消，等待线程可继续到 provider timeout，但其迟到响应不会再进入 Context 或触发工具。已开始的原子文件替换不会被异步强杀，避免留下半写文件。结束卡片只根据 Runtime 的 completion、verification snapshot、真实 Changes 和计数生成，停止状态永远优先于最近一次成功检查。
 
-取舍：没有 Web 服务、SSE、浏览器前端、可写编辑器、Settings 页面、Git 面板或第二套异步 Runtime。项目树和预览刻意保持只读；历史是线性本地 Session，不伪装成分支式会话中心。基础 `requirements.txt` 不引入 Qt，CLI 仍可独立安装。
+取舍：没有 Web 服务、SSE、浏览器前端、可写编辑器、Settings 页面、Git 面板或第二套异步 Runtime。项目树和预览刻意保持只读；历史是线性本地 Session，不伪装成分支式会话中心。基础安装不引入 Qt，CLI 仍可独立安装。
 
 ## 9. 为什么 Context 同时保存完整历史和有界模型视图
 

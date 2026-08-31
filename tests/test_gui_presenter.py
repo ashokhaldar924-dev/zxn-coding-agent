@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import os
-import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from gui import _approval_parts
-from gui_presenter import GuiPresenter
+from zxn_agent.gui import _approval_parts
+from zxn_agent.gui_presenter import GuiPresenter
 
 
 def verification(current: bool, *, rev: int = 3, verified: int = 2) -> dict:

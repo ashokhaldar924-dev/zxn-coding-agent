@@ -1,5 +1,8 @@
 # zxn-coding-agent
 
+[![CI](https://github.com/ashokhaldar924-dev/zxn-coding-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/ashokhaldar924-dev/zxn-coding-agent/actions/workflows/ci.yml)
+![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+
 一个运行在本地工作区中的 Coding Agent。它接收自然语言任务，自主阅读和搜索代码、修改文件、执行命令，并根据真实验证结果决定继续修复或结束。
 
 项目使用 Python 和 OpenAI-compatible Chat Completions API，不依赖 Agent 框架。Agent Loop、上下文管理、工具调度、权限控制、状态恢复和验证门禁都保持为可阅读、可测试的本地实现。
@@ -25,7 +28,7 @@
 ```powershell
 git clone https://github.com/ashokhaldar924-dev/zxn-coding-agent.git
 cd zxn-coding-agent
-python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 通过环境变量配置 OpenAI-compatible endpoint：
@@ -41,13 +44,13 @@ API Key 只从环境变量读取；Windows 下也会读取当前用户的持久�
 ### Run a task
 
 ```powershell
-python .\agent.py --workspace "D:\path\to\project" "检查项目，运行失败测试，定位并修复实现；不要修改测试，完成后实际验证。"
+zxn-agent --workspace "D:\path\to\project" "检查项目，运行失败测试，定位并修复实现；不要修改测试，完成后实际验证。"
 ```
 
 使用 `--yes` 可以自动通过需要确认的操作，但不能绕过 Runtime 明确禁止的危险行为：
 
 ```powershell
-python .\agent.py --yes --workspace "D:\path\to\project" "修复当前项目中的失败测试并验证结果。"
+zxn-agent --yes --workspace "D:\path\to\project" "修复当前项目中的失败测试并验证结果。"
 ```
 
 ### Interactive mode
@@ -55,7 +58,7 @@ python .\agent.py --yes --workspace "D:\path\to\project" "修复当前项目中�
 省略任务参数即可持续输入自然语言任务：
 
 ```powershell
-python .\agent.py --workspace "D:\path\to\project"
+zxn-agent --workspace "D:\path\to\project"
 ```
 
 交互模式支持：
@@ -94,8 +97,8 @@ TTY 使用少量颜色；重定向、CI 或不支持 Unicode 的 Windows 输出�
 GUI 是可选的 PySide6 单窗口界面，不影响基础 CLI 依赖：
 
 ```powershell
-python -m pip install -r requirements-gui.txt
-python .\agent.py --gui --workspace "D:\path\to\project"
+python -m pip install -e ".[gui]"
+zxn-agent --gui --workspace "D:\path\to\project"
 ```
 
 界面左侧提供当前工作区的只读项目树和本轮 Changes，中间显示任务、工具、文件变化与命令摘要，右侧固定显示 Plan 和 Runtime Verification。顶部可以切换或重新打开最近工作区，并从本地 Session History 恢复任务；底部直接输入自然语言任务。Plan 下方的 Evidence 只引用真实工具事件。
@@ -146,18 +149,20 @@ flowchart LR
 - Session 记录创建或确认时的 Git HEAD；恢复到不同代码基线时要求用户确认。
 - Session、trajectory、Checkpoint 和截断命令全文保存在 workspace 的私有 `.agent/` 目录。
 
-更完整的状态语义、安全边界和设计取舍见 [`DESIGN.md`](DESIGN.md)。
+更完整的状态语义、安全边界和设计取舍见 [`docs/DESIGN.md`](docs/DESIGN.md)。
 
 ## Tests and evaluation
 
 离线测试不需要 API Key：
 
 ```powershell
+python -m pip install -e ".[dev]"
+ruff check .
 python -m unittest discover -s tests -v
-python -m compileall -q .
+python -m compileall -q src tests evals agent.py
 ```
 
-169 个测试覆盖 Agent Loop、tool-call/finish-reason 协议、失败修复进度、Planner Evidence、终端与 GUI presenter、Evidence Report、任务级恢复、工作区切换与历史数据、用户停止、验证范围、真实 Diff/行数统计、请求预算、可分页 observation、原子编辑、多语言代码概览、权限、Checkpoint、Session、陈旧写保护、增量 workspace snapshot、命令进程树与长输出恢复、验证门禁和终止条件。
+离线测试覆盖 Agent Loop、tool-call/finish-reason 协议、失败修复进度、Planner Evidence、终端与 GUI presenter、Evidence Report、任务级恢复、工作区切换与历史数据、用户停止、验证范围、真实 Diff/行数统计、请求预算、可分页 observation、原子编辑、多语言代码概览、权限、Checkpoint、Session、陈旧写保护、增量 workspace snapshot、命令进程树与长输出恢复、验证门禁和终止条件。
 
 `evals/` 提供 8 个隔离的代码修复任务。Harness 会保护可见测试，Agent 退出后再在独立目录运行 hidden grader，并记录成功、错误完成、首次验证、失败恢复、`NO_PROGRESS`、耗时、Token、模型与工具调用。`--repeat` 支持重复运行预先选定的任务：
 
@@ -179,26 +184,16 @@ python .\evals\run_eval.py --case percentage-pricing --repeat 3
 ## Project layout
 
 ```text
-agent.py                Agent Loop、tool-call 解析与 CLI
-llm.py                  OpenAI-compatible 模型请求
-ctx.py / state.py       有界上下文与 RuntimeState
-planner.py              可恢复的轻量任务计划
-changes.py / ui.py      真实文件变化摘要与终端 renderer
-gui.py / gui_presenter.py  可选桌面窗口与纯事件投影
-gui_data.py             工作区、最近项目与只读文件数据适配
-evidence_report.py      Runtime Evidence Report
-tools.py                工具 schema、registry 与 dispatcher
-workspace_state.py      workspace snapshot 与陈旧写保护
-verification.py         显式全量要求与常见 verifier 范围识别
-command_runtime.py      命令进程树、超时和流式输出存储
-permissions.py          ALLOW / ASK / DENY 权限策略
-checkpoint.py           文件 before-image 与安全恢复
-session.py / log.py     Session 与 trajectory
-interactive.py          交互命令、@file 与 !command
-evals/                  可重复评测任务
-tests/                  离线测试
-DESIGN.md               设计说明与实现边界
+src/zxn_agent/          可安装的 Agent Runtime、CLI 与桌面 GUI
+tests/                  Agent Loop 和各项 Runtime 边界的离线测试
+evals/                  隔离修复任务、评测协议与公开结果
+docs/DESIGN.md          状态语义、边界与设计取舍
+agent.py                源码克隆场景的兼容启动入口
+pyproject.toml          包元数据、依赖、命令入口与开发配置
+.github/workflows/      Linux / Windows 持续集成
 ```
+
+安装后推荐使用 `zxn-agent`；直接从源码克隆运行时，原有的 `python agent.py ...` 命令仍然可用。
 
 ## Limitations
 

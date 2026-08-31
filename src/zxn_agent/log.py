@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import config
+from . import config
 
 
 def redact(value: Any, secret: str) -> Any:

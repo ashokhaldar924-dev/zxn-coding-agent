@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import config
-from state import State, ToolRes
+from . import config
+from .state import State, ToolRes
 
 FILE_REF_RE = re.compile(r'(?<!\S)@(?:"([^"]+)"|(\S+))')
 MAX_FILE_REFERENCES = 5

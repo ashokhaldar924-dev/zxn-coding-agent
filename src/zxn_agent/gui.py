@@ -12,22 +12,20 @@ import time
 from pathlib import Path
 from typing import Any
 
-import config
-import interactive
-import ui
-from checkpoint import CheckpointError
-from command_runtime import read_saved_output_range
-from evidence_report import report_markdown
-from gui_data import (
+from . import config, interactive, ui
+from .checkpoint import CheckpointError
+from .command_runtime import read_saved_output_range
+from .evidence_report import report_markdown
+from .gui_data import (
     RecentWorkspaceStore,
     WorkspaceDataError,
     project_files,
     read_workspace_text,
     switch_workspace,
 )
-from gui_presenter import ActivityItem, GuiPresenter, OutcomeView
-from log import RunLog
-from session import SessionStore
+from .gui_presenter import ActivityItem, GuiPresenter, OutcomeView
+from .log import RunLog
+from .session import SessionStore
 
 try:
     from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
@@ -914,12 +912,12 @@ def launch(runtime_module: Any = None, *, prefer_recent: bool = False) -> int:
     if QObject is None:
         print(
             "PySide6 is required for the desktop GUI. "
-            "Install it with: python -m pip install -r requirements-gui.txt",
+            'Install it with: python -m pip install -e ".[gui]"',
             file=sys.stderr,
         )
         return 2
     if runtime_module is None:
-        import agent as runtime_module
+        from . import agent as runtime_module
 
     if prefer_recent:
         recent = RecentWorkspaceStore().load()

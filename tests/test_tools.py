@@ -12,12 +12,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import config
-import tools
-from gitguard import GitGuard
-from state import State
+from zxn_agent import config, tools
+from zxn_agent.gitguard import GitGuard
+from zxn_agent.state import State
 
 
 class TestTools(unittest.TestCase):

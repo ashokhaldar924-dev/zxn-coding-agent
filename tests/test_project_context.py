@@ -1,16 +1,11 @@
 from __future__ import annotations
 
-import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import agent
-import config
-from project_context import load_project_context
+from zxn_agent import agent, config
+from zxn_agent.project_context import load_project_context
 
 
 class TestProjectContext(unittest.TestCase):

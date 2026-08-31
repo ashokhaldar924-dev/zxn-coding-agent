@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import sys
 import tempfile
 import unittest
 from pathlib import Path
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from evals.cases import CASES
 from evals.run_eval import (

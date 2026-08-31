@@ -2,19 +2,14 @@ from __future__ import annotations
 
 import contextlib
 import io
-import os
 import shutil
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import config
-import tools
-from checkpoint import CheckpointError, CheckpointManager
-from state import State
+from zxn_agent import config, tools
+from zxn_agent.checkpoint import CheckpointError, CheckpointManager
+from zxn_agent.state import State
 
 
 class TestCheckpoint(unittest.TestCase):

@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from gitguard import GitGuard
+from zxn_agent.gitguard import GitGuard
 
 
 class TestGitGuard(unittest.TestCase):
@@ -36,7 +32,7 @@ class TestGitGuard(unittest.TestCase):
                 stderr="",
             )
             with mock.patch(
-                "gitguard.subprocess.run",
+                "zxn_agent.gitguard.subprocess.run",
                 side_effect=[root_result, head_result, status_result],
             ):
                 guard = GitGuard.scan(repo)
@@ -58,7 +54,7 @@ class TestGitGuard(unittest.TestCase):
 
     def test_scan_degrades_cleanly_outside_git(self):
         failed = subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="not git")
-        with mock.patch("gitguard.subprocess.run", return_value=failed):
+        with mock.patch("zxn_agent.gitguard.subprocess.run", return_value=failed):
             guard = GitGuard.scan("D:/not-a-repository")
         self.assertFalse(guard.active)
         self.assertEqual(guard.initial_dirty, set())

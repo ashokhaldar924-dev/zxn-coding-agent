@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-import os
 import shutil
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import config
-from interactive import expand_file_references, shell_observation, status_text
-from state import State, ToolRes
+from zxn_agent import config
+from zxn_agent.interactive import expand_file_references, shell_observation, status_text
+from zxn_agent.state import State, ToolRes
 
 
 class TestInteractiveHelpers(unittest.TestCase):

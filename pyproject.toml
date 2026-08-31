@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zxn-coding-agent"
+version = "0.1.0"
+description = "A local, evidence-driven coding agent with guarded tool execution."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+]
+
+[project.urls]
+Repository = "https://github.com/ashokhaldar924-dev/zxn-coding-agent"
+Issues = "https://github.com/ashokhaldar924-dev/zxn-coding-agent/issues"
+
+[project.optional-dependencies]
+gui = [
+    "PySide6>=6.7,<7",
+]
+dev = [
+    "ruff>=0.12,<1",
+]
+
+[project.scripts]
+zxn-agent = "zxn_agent.agent:main"
+zxn-agent-gui = "zxn_agent.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+extend-exclude = ["evals/results"]

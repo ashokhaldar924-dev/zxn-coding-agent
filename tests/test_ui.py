@@ -4,17 +4,14 @@ import contextlib
 import io
 import os
 import shutil
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import ui
-from changes import FileChange, summarize_text_change
-from planner import PlanState
-from state import State, ToolRes
+from zxn_agent import ui
+from zxn_agent.changes import FileChange, summarize_text_change
+from zxn_agent.planner import PlanState
+from zxn_agent.state import State, ToolRes
 
 
 class TestTerminalRenderer(unittest.TestCase):
