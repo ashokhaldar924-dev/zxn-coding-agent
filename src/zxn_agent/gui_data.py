@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 NOISE_DIRS = frozenset(
@@ -15,6 +16,14 @@ MAX_FILE_PREVIEW_BYTES = 512_000
 
 class WorkspaceDataError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ProjectEntry:
+    """One safe, visible file-system entry in the GUI project tree."""
+
+    path: str
+    is_directory: bool
 
 
 class RecentWorkspaceStore:
@@ -90,6 +99,35 @@ def project_files(
             if needle and needle not in relative.casefold():
                 continue
             found.append(relative)
+            if len(found) >= max(1, limit):
+                return found
+    return found
+
+
+def project_entries(
+    workspace: str | Path,
+    *,
+    query: str = "",
+    limit: int = MAX_PROJECT_FILES,
+) -> list[ProjectEntry]:
+    """List visible files and directories, including empty directories."""
+
+    root = resolve_workspace(workspace)
+    needle = query.casefold().strip()
+    found: list[ProjectEntry] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(name for name in dirnames if name not in NOISE_DIRS)
+        candidates = [(name, True) for name in dirnames]
+        candidates.extend((name, False) for name in sorted(filenames))
+        for name, is_directory in candidates:
+            path = Path(dirpath, name)
+            try:
+                relative = path.resolve().relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+            if needle and needle not in relative.casefold():
+                continue
+            found.append(ProjectEntry(relative, is_directory))
             if len(found) >= max(1, limit):
                 return found
     return found

@@ -17,9 +17,10 @@ from .checkpoint import CheckpointError
 from .command_runtime import read_saved_output_range
 from .evidence_report import report_markdown
 from .gui_data import (
+    ProjectEntry,
     RecentWorkspaceStore,
     WorkspaceDataError,
-    project_files,
+    project_entries,
     read_workspace_text,
     switch_workspace,
 )
@@ -193,7 +194,7 @@ if QObject is not None:
             self._worker: AgentWorker | None = None
             self._running = False
             self._run_started_at = 0.0
-            self._all_project_files: list[str] = []
+            self._all_project_entries: list[ProjectEntry] = []
             self._build()
             try:
                 self.recent_store.remember(config.WORKSPACE_DIR)
@@ -541,9 +542,9 @@ if QObject is not None:
 
         def _refresh_project_files(self) -> None:
             try:
-                self._all_project_files = project_files(config.WORKSPACE_DIR)
+                self._all_project_entries = project_entries(config.WORKSPACE_DIR)
             except WorkspaceDataError:
-                self._all_project_files = []
+                self._all_project_entries = []
             self._filter_project_files(self.file_filter.text() if hasattr(self, "file_filter") else "")
 
         @Slot(str)
@@ -551,15 +552,15 @@ if QObject is not None:
             if not hasattr(self, "project_tree"):
                 return
             needle = query.casefold().strip()
-            paths = [
-                path for path in self._all_project_files
-                if not needle or needle in path.casefold()
+            entries = [
+                entry for entry in self._all_project_entries
+                if not needle or needle in entry.path.casefold()
             ]
             self.project_tree.clear()
             nodes: dict[str, QTreeWidgetItem] = {}
-            for path in paths:
+            for entry in entries:
                 parent = self.project_tree.invisibleRootItem()
-                parts = path.split("/")
+                parts = entry.path.split("/")
                 key_parts: list[str] = []
                 for index, part in enumerate(parts):
                     key_parts.append(part)
@@ -569,8 +570,8 @@ if QObject is not None:
                         item = QTreeWidgetItem([part])
                         parent.addChild(item)
                         nodes[key] = item
-                    if index == len(parts) - 1:
-                        item.setData(0, Qt.ItemDataRole.UserRole, path)
+                    if index == len(parts) - 1 and not entry.is_directory:
+                        item.setData(0, Qt.ItemDataRole.UserRole, entry.path)
                     parent = item
             if needle:
                 self.project_tree.expandAll()

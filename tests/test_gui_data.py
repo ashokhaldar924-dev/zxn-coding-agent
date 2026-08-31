@@ -9,6 +9,7 @@ from zxn_agent.changes import unified_byte_diff
 from zxn_agent.gui_data import (
     RecentWorkspaceStore,
     WorkspaceDataError,
+    project_entries,
     project_files,
     read_workspace_text,
     switch_workspace,
@@ -55,6 +56,19 @@ class TestGuiData(unittest.TestCase):
         self.assertFalse(truncated)
         with self.assertRaisesRegex(WorkspaceDataError, "escapes"):
             read_workspace_text(self.tmpdir, "../outside.txt")
+
+    def test_project_entries_include_empty_directories_and_hide_runtime_noise(self):
+        (self.tmpdir / "empty-demo").mkdir()
+        (self.tmpdir / "src").mkdir()
+        (self.tmpdir / "src" / "app.py").write_text("pass\n", encoding="utf-8")
+        (self.tmpdir / ".agent").mkdir()
+
+        entries = [(entry.path, entry.is_directory) for entry in project_entries(self.tmpdir)]
+
+        self.assertIn(("empty-demo", True), entries)
+        self.assertIn(("src", True), entries)
+        self.assertIn(("src/app.py", False), entries)
+        self.assertNotIn((".agent", True), entries)
 
     def test_real_diff_supports_added_modified_deleted_and_bounded_output(self):
         added = unified_byte_diff("new.py", None, b"a\nb\n")
