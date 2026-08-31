@@ -83,7 +83,8 @@ class TestTools(unittest.TestCase):
         )
 
     def test_safe_path_and_traversal(self):
-        self.assertEqual(tools._resolve_safe_path("a.txt"), Path(self.tmpdir) / "a.txt")
+        expected = (Path(self.tmpdir) / "a.txt").resolve(strict=False)
+        self.assertEqual(tools._resolve_safe_path("a.txt"), expected)
         result = self.run_tool("read_file", {"path": "../outside.txt"})
         private = self.run_tool("read_file", {"path": ".agent/session.jsonl"})
         self.assertFalse(result.ok)
