@@ -42,6 +42,17 @@ def build_evidence_report(
             "checks": len(st.check_attempts),
             "input_tokens": st.task_in_tok,
             "output_tokens": st.task_out_tok,
+            "prompt_tokens": st.task_in_tok,
+            "completion_tokens": st.task_out_tok,
+            "prompt_cache_hit_tokens": (
+                st.task_cache_hit_tok if st.task_cache_usage_reported else None
+            ),
+            "prompt_cache_miss_tokens": (
+                st.task_cache_miss_tok if st.task_cache_usage_reported else None
+            ),
+            "reasoning_tokens": (
+                st.task_reasoning_tok if st.task_reasoning_usage_reported else None
+            ),
             "total_tokens": st.task_tokens,
             "steps": st.step,
             "duration_seconds": elapsed_seconds,
@@ -97,6 +108,9 @@ def report_markdown(report: dict[str, Any]) -> str:
             f"- Tokens: {metrics.get('total_tokens', 0)} "
             f"(input {metrics.get('input_tokens', 0)}, output {metrics.get('output_tokens', 0)})"
         ),
+        f"- Prompt cache hit: {_metric_value(metrics.get('prompt_cache_hit_tokens'))}",
+        f"- Prompt cache miss: {_metric_value(metrics.get('prompt_cache_miss_tokens'))}",
+        f"- Reasoning tokens: {_metric_value(metrics.get('reasoning_tokens'))}",
         f"- Steps: {metrics.get('steps', 0)}",
         f"- Duration: {metrics.get('duration_seconds', 0)}s",
         "",
@@ -135,3 +149,7 @@ def report_markdown(report: dict[str, Any]) -> str:
     lines.append(json.dumps(evidence, ensure_ascii=False, indent=2))
     lines.extend(["```", "", "## Summary", "", str(outcome.get("model_or_runtime_summary", "")), ""])
     return "\n".join(lines)
+
+
+def _metric_value(value: object) -> str:
+    return "unavailable" if value is None else str(value)

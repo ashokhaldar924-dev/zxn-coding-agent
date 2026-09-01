@@ -55,7 +55,17 @@ class TestEvalFixtures(unittest.TestCase):
         log_dir = workspace / ".agent"
         log_dir.mkdir(parents=True)
         events = [
-            {"event": "model_response", "step": 1},
+            {
+                "event": "model_response",
+                "step": 1,
+                "usage": {
+                    "input_tokens": 120,
+                    "output_tokens": 30,
+                    "prompt_cache_hit_tokens": 80,
+                    "prompt_cache_miss_tokens": 40,
+                    "reasoning_tokens": 20,
+                },
+            },
             {"event": "tool_call", "step": 1, "name": "check_command"},
             {
                 "event": "tool_result",
@@ -98,6 +108,11 @@ class TestEvalFixtures(unittest.TestCase):
         self.assertEqual(metrics["workspace_change_events"], 1)
         self.assertEqual(metrics["saved_command_outputs"], 1)
         self.assertEqual(metrics["tokens"], 150)
+        self.assertEqual(metrics["prompt_tokens"], 120)
+        self.assertEqual(metrics["completion_tokens"], 30)
+        self.assertEqual(metrics["prompt_cache_hit_tokens"], 80)
+        self.assertEqual(metrics["prompt_cache_miss_tokens"], 40)
+        self.assertEqual(metrics["reasoning_tokens"], 20)
         self.assertEqual(metrics["task_elapsed_seconds"], 2.5)
         self.assertEqual(metrics["model_calls"], 1)
         self.assertFalse(metrics["no_progress"])

@@ -10,6 +10,8 @@ from dataclasses import dataclass
 
 from . import config
 
+MAX_RETAINED_GROUP_OVERHEAD_CHARS = 6_000
+
 
 @dataclass(frozen=True)
 class ContextStats:
@@ -52,6 +54,64 @@ def _flatten(groups: list[list[dict]]) -> list[dict]:
     return [message for group in groups for message in group]
 
 
+def _tool_names_by_id(group: list[dict]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for message in group:
+        for call in message.get("tool_calls", []):
+            if not isinstance(call, dict):
+                continue
+            call_id = call.get("id")
+            function = call.get("function")
+            if isinstance(call_id, str) and isinstance(function, dict):
+                name = function.get("name")
+                if isinstance(name, str):
+                    names[call_id] = name
+    return names
+
+
+def _group_has_retained_payload(group: list[dict], payloads: set[str]) -> bool:
+    return any(
+        message.get("role") == "tool" and message.get("content") in payloads
+        for message in group
+    )
+
+
+def _retained_group_selection(
+    groups: list[list[dict]],
+    payloads: set[str],
+) -> tuple[set[int], set[str]]:
+    """Pin economical original groups without carrying huge reasoning overhead."""
+
+    latest: dict[str, int] = {}
+    for index, group in enumerate(groups):
+        for message in group:
+            content = message.get("content")
+            if message.get("role") == "tool" and content in payloads:
+                latest[str(content)] = index
+    by_group: dict[int, set[str]] = {}
+    for payload, index in latest.items():
+        by_group.setdefault(index, set()).add(payload)
+    selected_indexes: set[int] = set()
+    selected_payloads: set[str] = set()
+    for index in sorted(by_group, reverse=True):
+        group_payloads = by_group[index]
+        source_group = groups[index]
+        reasoning_chars = sum(
+            len(str(message.get("reasoning_content") or ""))
+            for message in source_group
+        )
+        overhead = _message_chars(source_group) - sum(
+            len(payload) for payload in group_payloads
+        )
+        if (
+            reasoning_chars <= MAX_RETAINED_GROUP_OVERHEAD_CHARS
+            and overhead <= MAX_RETAINED_GROUP_OVERHEAD_CHARS
+        ):
+            selected_indexes.add(index)
+            selected_payloads.update(group_payloads)
+    return selected_indexes, selected_payloads
+
+
 class Ctx:
     """Preserve full session history while building a bounded model view.
 
@@ -70,6 +130,7 @@ class Ctx:
         self.groups: list[list[dict]] = []
         self.active = True
         self.last_stats = ContextStats()
+        self.last_retained_evidence: frozenset[str] = frozenset()
 
     @property
     def current_task(self) -> str:
@@ -115,10 +176,12 @@ class Ctx:
         current: list[list[dict]],
         runtime_state: str | None,
     ) -> list[dict]:
-        system = deepcopy(self.head[0])
+        messages = [deepcopy(self.head[0])]
         if runtime_state:
-            system["content"] = str(system.get("content") or "") + "\n\n" + runtime_state
-        messages = [system, *_flatten(history)]
+            messages[0]["content"] = (
+                f"{messages[0].get('content', '')}\n\n{runtime_state}"
+            )
+        messages.extend(_flatten(history))
         if self.active:
             messages.append(deepcopy(self.head[1]))
         messages.extend(_flatten(current))
@@ -135,16 +198,25 @@ class Ctx:
         self,
         runtime_state: str | None = None,
         *,
+        retained_evidence: tuple[str, ...] | list[str] | None = None,
         reserved_tokens: int = 0,
     ) -> list[dict]:
         if not isinstance(reserved_tokens, int) or reserved_tokens < 0:
             raise ValueError("reserved_tokens must be a non-negative integer")
-        # MAX_GROUPS limits only the model view. The durable transcript remains
-        # complete in history_groups/groups and in the session JSONL.
-        current = deepcopy(self.groups[-config.MAX_GROUPS :])
+        # MAX_GROUPS bounds the ordinary recent view. A small number of original
+        # read_file groups may remain pinned while State retains their exact
+        # payloads; this preserves provider fields such as reasoning_content.
+        evidence = set(retained_evidence or ())
+        recent_start = max(0, len(self.groups) - config.MAX_GROUPS)
+        selected_indexes = set(range(recent_start, len(self.groups)))
+        pinned_indexes, pinned_payloads = _retained_group_selection(
+            self.groups,
+            evidence,
+        )
+        selected_indexes.update(pinned_indexes)
+        current = [deepcopy(self.groups[index]) for index in sorted(selected_indexes)]
         remaining = max(0, config.MAX_GROUPS - len(current))
         history = deepcopy(self.history_groups[-remaining:]) if remaining else []
-
         messages = self._assemble(history, current, runtime_state)
         before_chars = _message_chars(messages)
         before_tokens = _message_tokens(messages)
@@ -157,19 +229,29 @@ class Ctx:
                 self._assemble(history, current, runtime_state), reserved_tokens
             ):
                 break
+            tool_names = _tool_names_by_id(group)
             for message in group:
                 if message.get("role") != "tool":
                     continue
                 content = message.get("content")
                 if not isinstance(content, str) or content.startswith("[older tool output pruned:"):
                     continue
+                if content in pinned_payloads:
+                    continue
                 output_ref = re.search(r"\bcmd-[0-9a-f]{12}\.txt\b", content)
-                saved = (
-                    f"; full command output remains available as {output_ref.group(0)} "
-                    "via read_command_output"
-                    if output_ref
-                    else "; re-run the tool if exact details are still needed"
-                )
+                tool_name = tool_names.get(str(message.get("tool_call_id") or ""))
+                if output_ref:
+                    saved = (
+                        f"; full command output remains available as {output_ref.group(0)} "
+                        "via read_command_output"
+                    )
+                elif tool_name == "read_file":
+                    saved = (
+                        "; reuse it from the Runtime exact-file working set when "
+                        "present; otherwise request only the smallest missing snippet"
+                    )
+                else:
+                    saved = "; use a targeted tool call only if exact details are still needed"
                 message["content"] = (
                     f"[older tool output pruned: {len(content)} characters{saved}.]"
                 )
@@ -185,18 +267,31 @@ class Ctx:
             history.pop(0)
             dropped += 1
 
-        while (
-            len(current) > config.CONTEXT_KEEP_FULL_GROUPS
-            and self._over_budget(
-                self._assemble(history, current, runtime_state), reserved_tokens
-            )
+        while self._over_budget(
+            self._assemble(history, current, runtime_state), reserved_tokens
         ):
-            current.pop(0)
+            protected_from = max(0, len(current) - config.CONTEXT_KEEP_FULL_GROUPS)
+            removable = next(
+                (
+                    index
+                    for index, group in enumerate(current[:protected_from])
+                    if not _group_has_retained_payload(group, pinned_payloads)
+                ),
+                None,
+            )
+            if removable is None:
+                break
+            current.pop(removable)
             dropped += 1
 
         messages = self._assemble(history, current, runtime_state)
         after_chars = _message_chars(messages)
         after_tokens = _message_tokens(messages)
+        self.last_retained_evidence = frozenset(
+            str(message.get("content"))
+            for message in messages
+            if message.get("role") == "tool" and message.get("content") in evidence
+        )
         self.last_stats = ContextStats(
             before_chars=before_chars,
             after_chars=after_chars,

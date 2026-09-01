@@ -127,11 +127,11 @@ Stop 使用 `State` 中不持久化的 process-local cancellation event。Agent 
 
 RuntimeState 包含 revision、验证状态、已跟踪变化文件、最新 check、当前 Plan、外部 shell 变更标记和快照是否完整。它不是模型摘要，因此不会因历史裁剪而“记错”运行状态。
 
-为减少无意义的重复输入，`read_file` 对“同一路径、同一实际显示范围、同一输出摘要”做短期 observation 去重。工具每次仍读取当前文件；只有第一次完整输出仍处于模型视图窗口时才返回短提示。缓存不写入 session，新用户 turn、上下文裁剪、内容变化或窗口到期都会恢复完整输出。
+为减少无意义的重复输入，`read_file` 对“同一路径、同一实际显示范围、同一输出摘要”做 observation 去重。工具每次仍重新读取并计算当前结果，真实性不依赖缓存。Runtime 另外维护一个仅限当前进程、按范围数和总字符数双重限制的精确源码 working set；普通最近组窗口淘汰某次读取后，`Ctx` 会固定包含该结果的最新原始 logical group，而不是合成新的 assistant 消息。这样 `assistant` 的 `reasoning_content`、tool call 和 result 都保持 provider 返回的原始协议，源码也不会被提升到 system role。若保留一个小片段需要额外携带超过 6k 字符的 reasoning 或其他结果，则不固定该高开销组；`Ctx` 会把本轮实际仍可见的精确结果反馈给 `State`，不可见项立即退出 compact cache，下次读取必须重新发送全文。只有读取前已经存在精确证据时才能返回 compact hit。新用户 turn 会清空 working set；文件被 Agent、shell 或用户修改时，只使对应路径的证据和 inspected-range ledger 立即失效，不牵连未变化文件。
 
 命令输出超过 `MAX_TOOL_CHARS` 时，Runtime 把脱敏后的全文流式保存到当前 session 的 `.agent/outputs/`，tool result 只返回 head/tail preview、总字符数和 opaque id。`read_command_output` 只能读取当前 session（以及用户显式 shell scope）的指定 id，并直接按字符范围读取，不会先把全文重新装入内存；因此模型不必为了找回被截断的错误信息重跑测试，也不会获得读取其他 `.agent` 私有文件的通道。`read_file` 对超长单行做显式截断并保留续读行号；`list_dir`、`glob_files` 与 `search_text` 使用 `offset/limit` 分页，使 observation 在单轮内有界，同时仍能继续取得完整证据。
 
-取舍：短缓存只节省重复模型输入，不缓存文件真实性，也不尝试判断两个不同范围是否“语义相同”。估算不等同于具体 provider tokenizer；最新 group 单独超预算时会记录 `over_budget`，而不是破坏协议。暂不做 LLM compaction summary、RAG、embedding 或 vector DB，避免额外调用和不可确定的信息损失。
+取舍：working set 只保存已经真实返回给模型的有限精确文本，不做语义合并，也不写入 session；默认上限为 12 个范围、34k 字符，同时不超过字符窗口的 9/16。这个比例允许中小项目的一组核心源码跨裁剪保留，但总请求仍受原有 60k 字符、32k Token 预算及 tool schema / 输出预留共同约束，不以扩大每轮输入换取更少调用。超出限额按最近使用顺序淘汰，模型仍可按需读取缺失的小范围。它减少的是裁剪导致的重读，不缓存文件真实性，也不取代 stale-read 检查。估算不等同于具体 provider tokenizer；最新 group 单独超预算时会记录 `over_budget`，而不是破坏协议。GUI、Evidence Report 和 eval 会在 provider 提供相应字段时记录 prompt、completion、cache hit/miss 与 reasoning tokens，字段缺失时不伪造为 0。暂不做 LLM compaction summary、RAG、embedding 或 vector DB，避免额外调用和不可确定的信息损失。
 
 ## 10. 为什么 Repo Map 使用 Python AST 加轻量多语言声明匹配
 
@@ -149,7 +149,7 @@ RuntimeState 包含 revision、验证状态、已跟踪变化文件、最新 che
 
 选择：只保留一个快照式 `update_plan`。每次提交 1–8 个 `pending / in_progress / completed` 步骤，最多一个步骤进行中；简单任务不要求创建计划。对于已有仓库，首次计划前先完成最少必要的只读调查；空仓库可以直接按技术问题规划。
 
-实现：`planner.py` 保存短小、可序列化的 `PlanState`，并提供保守的生成策略检查。Runtime 只拒绝两类高置信度问题：已有仓库在没有至少两种有效只读观察时立即创建首次计划，以及由“实现功能 / 写测试 / 写 README / 跑测试”等通用活动构成的模板。System prompt 给出调度器和成绩分布两组任务特有示例，要求通常用 3–7 个可独立验证的技术里程碑；测试步骤必须说明验证的行为或边界，文档只有在用户明确要求时才单独进入计划。当前计划以紧凑确定性文本进入 Runtime context，通过 Session JSONL 恢复，并记录独立 `plan_update` trajectory event；每次状态推进都会使 CLI 与 GUI 立即重绘，而不是结束时一次跳满。只有新证据、失败根因或实现路线改变时才改写步骤文本。Planner 不触碰 workspace revision、fingerprint、Checkpoint 或 verification；任务因 step/time/token limit 停止时，界面保留真实未完成步骤。
+实现：`planner.py` 保存短小、可序列化的 `PlanState`，并提供保守的生成策略检查。Runtime 只拒绝两类高置信度问题：已有仓库在没有至少两种有效只读观察时立即创建首次计划，以及由“实现功能 / 写测试 / 写 README / 跑测试”等通用活动构成的模板。System prompt 给出调度器和成绩分布两组任务特有示例，要求通常用 3–7 个可独立验证的技术里程碑，并要求计划、进度和最终答复跟随用户语言；测试步骤必须说明验证的行为或边界，文档只有在用户明确要求时才单独进入计划。当前计划以紧凑确定性文本进入 Runtime context，通过 Session JSONL 恢复，并记录独立 `plan_update` trajectory event；真实文件改动或验证后，Runtime 会在下一模型回合静默要求同步计划状态，事件到达后 CLI 与 GUI 立即重绘。若模型在最终答复前仍遗漏同步，Runtime 只会在独立 Verification Gate 已接受完成后关闭残留导航状态；这个收口不能产生或替代验证。只有新证据、失败根因或实现路线改变时才改写步骤文本。Planner 不触碰 workspace revision、fingerprint、Checkpoint 或 verification；任务因 step/time/token limit 停止时，界面保留真实未完成步骤。
 
 取舍：策略检查有意不尝试理解任意自然语言计划，也不生成或重写模型的步骤；它只拦截明确的时机和模板错误，避免把 Planner 变成另一套语义引擎。没有 `create_plan / finish_task`、用户审批式 Plan Mode、第二个模型或独立 Planner Agent，也没有为展示层加入 Web 服务、通用 EventBus 或独立业务状态。计划表达“Agent 打算如何前进”，Verifier 才表达“当前代码是否真的通过”。
 
@@ -157,7 +157,7 @@ RuntimeState 包含 revision、验证状态、已跟踪变化文件、最新 che
 
 问题：模型可能连续重复完全相同的读取或命令，浪费轮次和 token。
 
-选择：第三次连续相同的已注册工具调用返回 stagnation observation；`check_command` 另有只面向验证失败的 Repair Progress；重复的未变化 `read_file` 输出由第 9 节的短缓存减少 token；`AGENT_MAX_TASK_TOKENS` 可选限制一次用户任务的累计 usage。
+选择：第三次连续相同的已注册工具调用返回 stagnation observation，用于阻止完全相同的无效调用循环。对普通只读调查不再设置额外回合上限或弹出警告；Runtime 保留已读文件区间账本并在上下文裁剪后继续提供，模型据此避免重建广泛文件视图。`check_command` 另有只面向验证失败的 Repair Progress；重复的未变化 `read_file` 输出由第 9 节的短缓存减少 token；`AGENT_MAX_TASK_TOKENS` 可选限制一次用户任务的累计 usage。
 
 实现：工具名和排序后的 JSON 参数形成 fingerprint；工具或参数变化立即重置。失败检查会去除路径前缀、时间戳、耗时、地址、行号和 pytest 进度噪声，再对保留的 failing test、exception、assertion/error 做 SHA-256。相同失败第二次给出根因复查警告，第三次标记 `NO_PROGRESS` 并停止；失败身份变化或验证成功会重置 streak。它只评价 repair 是否推进，不写入 `ok_rev`，也不替代 final gate。任务 Token 计数与 session 累计计数分开：达到配置预算 80% 后 RuntimeState 提醒模型减少探索，达到上限后在完整 tool-call/result 组边界停止，Session 仍可恢复；新用户 task 重置任务计数。默认值 0 表示关闭，provider 不返回 usage 时不伪造估算值。
 

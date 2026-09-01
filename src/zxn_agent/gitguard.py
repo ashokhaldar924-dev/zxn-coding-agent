@@ -34,7 +34,8 @@ class GitGuard:
     def scan(cls, workspace: str | Path) -> GitGuard:
         """Capture Git's initial dirty set; silently disable outside a repository."""
 
-        cwd = str(Path(workspace).resolve())
+        workspace_root = Path(workspace).resolve()
+        cwd = str(workspace_root)
         try:
             root_result = subprocess.run(
                 ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
@@ -86,7 +87,13 @@ class GitGuard:
             status = record[:2]
             path_text = record[3:] if len(record) >= 4 else ""
             if path_text:
-                dirty.add((repo_root / path_text).resolve(strict=False))
+                candidate = (repo_root / path_text).resolve(strict=False)
+                try:
+                    relative = candidate.relative_to(workspace_root)
+                except ValueError:
+                    relative = None
+                if relative is None or not relative.parts or relative.parts[0] != ".agent":
+                    dirty.add(candidate)
             index += 1
             if "R" in status or "C" in status:
                 index += 1

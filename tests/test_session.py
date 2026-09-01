@@ -39,6 +39,11 @@ class TestSession(unittest.TestCase):
             out_tok=4,
             task_in_tok=6,
             task_out_tok=2,
+            task_cache_hit_tok=4,
+            task_cache_miss_tok=2,
+            task_reasoning_tok=1,
+            task_cache_usage_reported=True,
+            task_reasoning_usage_reported=True,
             task_model_calls=3,
             task_tool_calls=5,
             check_attempts=[{"step": 2, "rc": 1, "progress": "failed"}],
@@ -77,6 +82,11 @@ class TestSession(unittest.TestCase):
         self.assertEqual(restored.task_tokens, 8)
         self.assertEqual(restored.task_model_calls, 3)
         self.assertEqual(restored.task_tool_calls, 5)
+        self.assertEqual(restored.task_cache_hit_tok, 4)
+        self.assertEqual(restored.task_cache_miss_tok, 2)
+        self.assertEqual(restored.task_reasoning_tok, 1)
+        self.assertTrue(restored.task_cache_usage_reported)
+        self.assertTrue(restored.task_reasoning_usage_reported)
         self.assertEqual(len(restored.check_attempts), 1)
         self.assertEqual(restored.planner_task, "follow-up task")
         self.assertEqual(restored.errs, 0)

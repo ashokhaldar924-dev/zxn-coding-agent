@@ -102,6 +102,16 @@ def status_text(st: State, session_path: Path | None, checkpoint_count: int) -> 
         if st.verification_required()
         else "not required"
     )
+    usage_details: list[str] = []
+    if st.task_cache_usage_reported:
+        usage_details.append(
+            f"cache hit/miss {st.task_cache_hit_tok}/{st.task_cache_miss_tok}"
+        )
+    if st.task_reasoning_usage_reported:
+        usage_details.append(f"reasoning {st.task_reasoning_tok}")
+    task_usage = f"current task {st.task_tokens}"
+    if usage_details:
+        task_usage += f" ({'; '.join(usage_details)})"
     return (
         f"session: {session}\n"
         f"permission mode: {config.PERMISSION_MODE}\n"
@@ -110,5 +120,5 @@ def status_text(st: State, session_path: Path | None, checkpoint_count: int) -> 
         f"workspace tracking complete: {'yes' if st.workspace_tracking_complete else 'no (partial)'}\n"
         f"plan: {st.plan.progress_text()}\n"
         f"active checkpoints: {checkpoint_count}\n"
-        f"tokens: session {st.in_tok + st.out_tok}; current task {st.task_tokens}"
+        f"tokens: session {st.in_tok + st.out_tok}; {task_usage}"
     )

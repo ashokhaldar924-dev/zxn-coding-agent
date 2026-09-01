@@ -43,6 +43,23 @@ class TestPlanner(unittest.TestCase):
             plan.replace([{"step": "First", "status": "skipped"}])
         self.assertEqual(plan.revision, 1)
 
+    def test_verified_finish_closes_navigation_without_changing_step_text(self):
+        plan = PlanState()
+        plan.replace([
+            {"step": "实现事务语义", "status": "in_progress"},
+            {"step": "运行全量回归验证", "status": "pending"},
+        ])
+
+        self.assertTrue(plan.complete_for_verified_finish())
+        self.assertEqual(
+            [(item.step, item.status) for item in plan.items],
+            [
+                ("实现事务语义", "completed"),
+                ("运行全量回归验证", "completed"),
+            ],
+        )
+        self.assertFalse(plan.complete_for_verified_finish())
+
     def test_update_plan_does_not_change_workspace_or_verification_state(self):
         Path(self.tmpdir, "a.py").write_text("value = 1\n", encoding="utf-8")
         st = State(rev=3, changed=True)
@@ -94,6 +111,7 @@ class TestPlanner(unittest.TestCase):
             "in_progress",
             "high-quality plan",
             "low-quality plan",
+            "same natural language",
             "never replaces runtime verification",
         ):
             self.assertIn(concept, policy)

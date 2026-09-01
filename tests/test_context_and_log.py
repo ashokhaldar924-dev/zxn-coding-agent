@@ -37,6 +37,16 @@ class TestContext(unittest.TestCase):
             {"role": "user", "content": "original task"},
         ])
 
+    def test_runtime_state_is_injected_into_the_system_message(self):
+        ctx = Ctx("stable system", "task")
+        ctx.add_group([{"role": "assistant", "content": "progress"}])
+
+        messages = ctx.build("runtime revision 2")
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("stable system", messages[0]["content"])
+        self.assertIn("runtime revision 2", messages[0]["content"])
+
     def test_old_groups_are_trimmed_as_whole_groups(self):
         ctx = Ctx("system", "task")
         for number in range(3):
@@ -69,14 +79,14 @@ class TestContext(unittest.TestCase):
         built[-1]["content"] = "mutated"
         self.assertEqual(ctx.build()[-1]["content"], "answer")
 
-    def test_old_large_tool_output_is_pruned_before_recent_group(self):
+    def test_old_large_command_output_is_pruned_before_recent_group(self):
         config.MAX_CONTEXT_CHARS = 700
         ctx = Ctx("system", "task")
         ctx.add_group([
             {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{"id": "old", "function": {"name": "read_file", "arguments": "{}"}}],
+                "tool_calls": [{"id": "old", "function": {"name": "run_command", "arguments": "{}"}}],
             },
             {
                 "role": "tool",
@@ -99,6 +109,124 @@ class TestContext(unittest.TestCase):
         self.assertIn("recent result", text)
         self.assertEqual(ctx.last_stats.pruned_tool_outputs, 1)
         self.assertFalse(ctx.last_stats.over_budget)
+
+    def test_old_large_file_output_is_replaced_without_source_body(self):
+        config.MAX_CONTEXT_CHARS = 650
+        ctx = Ctx("system", "task")
+        ctx.add_group([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "read-old",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"app.py","start":1,"end":120}',
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "read-old",
+                "content": "app.py 1-120 / 120\n" + "X" * 2_000,
+            },
+        ])
+        ctx.add_group([{"role": "assistant", "content": "recent"}])
+
+        text = json.dumps(ctx.build())
+
+        self.assertIn("older tool output pruned", text)
+        self.assertNotIn("X" * 100, text)
+
+    def test_retained_source_stays_in_tool_role_and_is_not_duplicated(self):
+        payload = "app.py 1-1 / 1\n\n1 | UNIQUE_SOURCE\n\n0 lines above, 0 lines below."
+        ctx = Ctx("system", "task")
+        ctx.add_group([
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "actual provider reasoning",
+                "tool_calls": [{
+                    "id": "original",
+                    "function": {"name": "read_file", "arguments": '{}'},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "original", "content": payload},
+        ])
+        ctx.add_group([{"role": "assistant", "content": "newer-1"}])
+        ctx.add_group([{"role": "assistant", "content": "newer-2"}])
+
+        messages = ctx.build("runtime facts", retained_evidence=[payload])
+
+        self.assertNotIn("UNIQUE_SOURCE", messages[0]["content"])
+        self.assertEqual(
+            sum("UNIQUE_SOURCE" in str(message.get("content")) for message in messages),
+            1,
+        )
+        source_message = next(
+            message for message in messages if "UNIQUE_SOURCE" in str(message.get("content"))
+        )
+        self.assertEqual(source_message["role"], "tool")
+        assistant = next(
+            message
+            for message in messages
+            if any(call.get("id") == "original" for call in message.get("tool_calls", []))
+        )
+        self.assertEqual(assistant["reasoning_content"], "actual provider reasoning")
+        self.assertEqual(ctx.last_retained_evidence, frozenset({payload}))
+
+    def test_bounded_working_set_can_retain_multiple_exact_read_groups(self):
+        first = "a.py 1-1 / 1\n\n1 | FIRST_SOURCE\n\n0 lines above, 0 lines below."
+        second = "b.py 1-1 / 1\n\n1 | SECOND_SOURCE\n\n0 lines above, 0 lines below."
+        ctx = Ctx("system", "task")
+        for call_id, payload in (("read-a", first), ("read-b", second)):
+            ctx.add_group([
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": call_id, "content": payload},
+            ])
+        ctx.add_group([{"role": "assistant", "content": "newer-1"}])
+        ctx.add_group([{"role": "assistant", "content": "newer-2"}])
+
+        messages = ctx.build(retained_evidence=[first, second])
+        serialized = json.dumps(messages)
+
+        self.assertIn("FIRST_SOURCE", serialized)
+        self.assertIn("SECOND_SOURCE", serialized)
+        self.assertEqual(ctx.last_retained_evidence, frozenset({first, second}))
+
+    def test_small_read_does_not_pin_a_group_with_huge_reasoning_overhead(self):
+        payload = "small.py 1-1 / 1\n\n1 | value = 1\n\n0 lines above, 0 lines below."
+        ctx = Ctx("system", "task")
+        ctx.add_group([
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "R" * 20_000,
+                "tool_calls": [{
+                    "id": "expensive-read",
+                    "function": {"name": "read_file", "arguments": '{}'},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "expensive-read",
+                "content": payload,
+            },
+        ])
+        ctx.add_group([{"role": "assistant", "content": "newer-1"}])
+        ctx.add_group([{"role": "assistant", "content": "newer-2"}])
+
+        messages = ctx.build(retained_evidence=[payload])
+
+        self.assertNotIn("value = 1", json.dumps(messages))
+        self.assertEqual(ctx.last_retained_evidence, frozenset())
 
     def test_oversized_old_group_is_dropped_whole(self):
         config.MAX_CONTEXT_CHARS = 500

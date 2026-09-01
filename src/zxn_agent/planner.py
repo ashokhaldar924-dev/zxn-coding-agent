@@ -16,11 +16,14 @@ PLAN_INVESTIGATION_TOOLS = frozenset(
 )
 
 PLANNER_POLICY_PROMPT = """Planning policy:
+- Use the same natural language as the latest user request for every plan step, progress update, clarification, and final answer. For a Chinese request, write these user-facing texts in Chinese. Keep code identifiers, file paths, commands, and API names unchanged.
 - Do not create a plan for a one-file read, a tiny obvious fix, one configuration edit, or a code question. Use a plan only when work has several technical stages and will need multiple tool rounds.
 - In an existing repository, investigate before the first plan: use the minimum useful combination of repository listing/map, search, and targeted reads to understand the affected modules and constraints. A new or empty project may be planned directly from the requirements.
+- Once that minimum investigation is sufficient, promptly plan or act. Do not rebuild a broad file-by-file view after context compaction; use the Runtime's inspected-range ledger and reread only the smallest exact snippet needed for the next edit.
 - Usually use 3-7 task-specific technical milestones. Split a step when it contains several independently verifiable mechanisms; do not split merely to reach a target count.
 - Do not use generic standalone steps such as implement feature, write code, write tests, write README/docs, summarize, or run tests. Tests may be milestones only when they say what behavior or boundary they validate. A final full-suite verification milestone is useful.
 - Keep at most one item in_progress. Mark the next milestone in_progress before working on it, mark completed milestones promptly, and call update_plan so the UI reflects real progress rather than jumping from 0/N to N/N.
+- When the Runtime reports concrete edit or verification evidence, reconcile the plan on the next response before moving to another milestone or returning a final answer. Preserve the step text when only statuses change.
 - Preserve step text when only statuses change. Revise the steps only when repository evidence, a failed test, or a changed implementation approach invalidates the previous route; add or remove only genuinely necessary work.
 - Plan completion is navigation state only and never replaces runtime verification.
 
@@ -215,6 +218,20 @@ class PlanState:
             return False
         self.items = items
         self.explanation = next_explanation
+        self.revision += 1
+        return True
+
+    def complete_for_verified_finish(self) -> bool:
+        """Close stale navigation state after the Runtime accepts a verified final.
+
+        This is deliberately a presentation/state-consistency operation. It is
+        called only after the independent completion gate has accepted the
+        current workspace, so plan state can never manufacture verification.
+        """
+
+        if not self.items or all(item.status == "completed" for item in self.items):
+            return False
+        self.items = [PlanItem(item.step, "completed") for item in self.items]
         self.revision += 1
         return True
 

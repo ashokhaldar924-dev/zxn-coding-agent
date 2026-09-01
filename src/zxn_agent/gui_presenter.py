@@ -93,6 +93,11 @@ class OutcomeView:
     tool_calls: int = 0
     checks: int = 0
     tokens: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cache_hit_tokens: int | None = None
+    cache_miss_tokens: int | None = None
+    reasoning_tokens: int | None = None
     repair_progress: str = "not_checked"
     termination_reason: str | None = None
 
@@ -153,7 +158,7 @@ class GuiPresenter:
                     ActivityItem(
                         _key(event, "baseline"),
                         "warning",
-                        f"Pre-existing workspace changes: {shown}{suffix}",
+                        f"任务开始前工作区已有改动：{shown}{suffix}",
                         "warning",
                     )
                 )
@@ -180,7 +185,7 @@ class GuiPresenter:
                     ActivityItem(
                         _key(event, "workspace"),
                         "warning",
-                        f"Workspace changed outside file tools: {shown}",
+                        f"检测到文件工具之外的工作区变更：{shown}",
                         "warning",
                     )
                 )
@@ -189,7 +194,7 @@ class GuiPresenter:
                 ActivityItem(
                     _key(event, "verification"),
                     "warning",
-                    "Verification is stale; another check is required",
+                    "验证已失效，需要重新执行检查",
                     "warning",
                 )
             )
@@ -204,12 +209,12 @@ class GuiPresenter:
                 ActivityItem(
                     _key(event, "resume"),
                     "task",
-                    "Resumed session " + _one_line(event.get("session_id", ""), 80),
+                    "已恢复会话 " + _one_line(event.get("session_id", ""), 80),
                     "accent",
                 )
             )
         elif kind in {"fatal_error", "gui_error"}:
-            message = _one_line(event.get("message", "Runtime error"), 800)
+            message = _one_line(event.get("message", "运行时错误"), 800)
             self.activity.append(
                 ActivityItem(_key(event, "error"), "error", message, "failure")
             )
@@ -224,7 +229,7 @@ class GuiPresenter:
             "interrupted",
             "user_stopped",
         }:
-            message = _one_line(event.get("message", "Task stopped"), 800)
+            message = _one_line(event.get("message", "任务已停止"), 800)
             self.activity.append(
                 ActivityItem(_key(event, "stopped"), "completion", message, "warning")
             )
@@ -258,7 +263,7 @@ class GuiPresenter:
         args = _arguments(event.get("arguments"))
         self._pending_tools[call_id] = (name, args)
         if name in {"run_command", "check_command"}:
-            label = "Verifying with" if name == "check_command" else "Running"
+            label = "正在验证：" if name == "check_command" else "正在运行："
             item = ActivityItem(
                 call_id or _key(event, "command"),
                 "command",
@@ -336,7 +341,7 @@ class GuiPresenter:
     def _finish_command(self, call_id: str, event: dict[str, Any], text: str) -> None:
         item = next((entry for entry in reversed(self.activity) if entry.key == call_id), None)
         if item is None:
-            item = ActivityItem(call_id, "command", "Command", "running")
+            item = ActivityItem(call_id, "command", "命令", "running")
             self.activity.append(item)
         rejected = event.get("rejected") is True or event.get("blocked") is True
         rc = event.get("rc")
@@ -351,10 +356,10 @@ class GuiPresenter:
             item.detail = [_one_line(text, 500)]
         elif event.get("ok") is True and rc == 0:
             item.tone = "success"
-            item.detail = [(_test_summary(text) or "Command passed") + elapsed_text]
+            item.detail = [(_test_summary(text) or "命令执行成功") + elapsed_text]
         else:
             item.tone = "failure"
-            summary = _test_summary(text) or f"Command failed (exit {rc})"
+            summary = _test_summary(text) or f"命令执行失败（退出码 {rc}）"
             item.detail = [summary + elapsed_text]
             item.detail.extend(
                 line for line in _important_lines(text) if line != summary
@@ -379,11 +384,11 @@ class GuiPresenter:
         if not completed:
             remaining = sum(item.status != "completed" for item in self.plan)
             if remaining:
-                detail.append(f"Plan incomplete: {remaining} step(s) remain")
+                detail.append(f"计划未完成：还剩 {remaining} 项")
         summary = ActivityItem(
             _key(event, "summary"),
             "completion",
-            "Completed" if completed else "Task stopped",
+            "任务完成" if completed else "任务已停止",
             "success" if completed else "warning",
             detail,
         )
@@ -446,6 +451,17 @@ class GuiPresenter:
                 metrics.get("total_tokens"),
                 _integer(event.get("input_tokens"), 0) + _integer(event.get("output_tokens"), 0),
             ),
+            prompt_tokens=_integer(
+                metrics.get("prompt_tokens"),
+                _integer(event.get("input_tokens"), 0),
+            ),
+            completion_tokens=_integer(
+                metrics.get("completion_tokens"),
+                _integer(event.get("output_tokens"), 0),
+            ),
+            cache_hit_tokens=_optional_integer(metrics.get("prompt_cache_hit_tokens")),
+            cache_miss_tokens=_optional_integer(metrics.get("prompt_cache_miss_tokens")),
+            reasoning_tokens=_optional_integer(metrics.get("reasoning_tokens")),
             repair_progress=_safe(
                 event.get("repair_progress", self.verification.progress)
             ),
@@ -465,7 +481,7 @@ class GuiPresenter:
             self.final_changes = [
                 change for change in self.final_changes if change.path not in restored_paths
             ]
-        message = _one_line(event.get("message", "Task changes restored"), 700)
+        message = _one_line(event.get("message", "已恢复本次任务的改动"), 700)
         self.activity.append(
             ActivityItem(_key(event, "restore"), "completion", message, "warning")
         )
@@ -490,25 +506,25 @@ def _tool_activity(
     if name == "read_file":
         start, end = args.get("start"), args.get("end")
         suffix = f":{start}-{end}" if start and end else f":{start}-" if start else ""
-        title = f"Read {path}{suffix}"
+        title = f"已读取 {path}{suffix}"
     elif name == "read_command_output":
-        title = f"Read saved command output {_one_line(args.get('output_id', ''), 120)}"
+        title = f"已读取保存的命令输出 {_one_line(args.get('output_id', ''), 120)}"
     elif name == "search_text":
-        title = f'Searched "{_one_line(args.get("query", ""), 180)}"'
+        title = f'已搜索“{_one_line(args.get("query", ""), 180)}”'
         count = _result_count(text)
         if count is not None:
-            title += f" · {count} matches"
+            title += f" · {count} 个匹配"
     elif name == "repo_map":
         count = _number(text, r"Repo map:\s*(\d+)\s+symbols")
-        title = "Inspected repository map" + (f" · {count} symbols" if count is not None else "")
+        title = "已检查仓库结构图" + (f" · {count} 个符号" if count is not None else "")
     elif name == "glob_files":
-        title = f"Matched {_one_line(args.get('pattern', ''), 180)}"
+        title = f"已匹配 {_one_line(args.get('pattern', ''), 180)}"
     elif name == "list_dir":
-        title = f"Listed {path}"
+        title = f"已列出 {path}"
     elif name in {"write_file", "edit_file", "multi_edit", "update_plan"}:
         return None
     else:
-        title = f"Completed {name}"
+        title = f"已完成 {name}"
     return ActivityItem(key, "tool", title)
 
 
@@ -546,7 +562,7 @@ def _test_summary(text: str) -> str | None:
         if re.search(r"\b\d+\s+(?:passed|failed)\b", clean, re.IGNORECASE):
             candidates.append(clean)
         elif clean == "OK":
-            candidates.append("Tests passed")
+            candidates.append("测试通过")
     return _one_line(candidates[-1], 260) if candidates else None
 
 
@@ -585,6 +601,10 @@ def _number(text: str, pattern: str) -> int | None:
 
 def _integer(value: object, default: int) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def _optional_integer(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _key(event: dict[str, Any], suffix: str) -> str:

@@ -70,6 +70,23 @@ class TestGuiData(unittest.TestCase):
         self.assertIn(("src/app.py", False), entries)
         self.assertNotIn((".agent", True), entries)
 
+    def test_project_entries_reflect_filesystem_changes_without_cached_results(self):
+        created = self.tmpdir / "created"
+        created.mkdir()
+        (created / "new.py").write_text("pass\n", encoding="utf-8")
+
+        first = {(entry.path, entry.is_directory) for entry in project_entries(self.tmpdir)}
+        self.assertIn(("created/new.py", False), first)
+
+        renamed = self.tmpdir / "renamed"
+        created.rename(renamed)
+        second = {(entry.path, entry.is_directory) for entry in project_entries(self.tmpdir)}
+
+        self.assertNotIn(("created", True), second)
+        self.assertNotIn(("created/new.py", False), second)
+        self.assertIn(("renamed", True), second)
+        self.assertIn(("renamed/new.py", False), second)
+
     def test_real_diff_supports_added_modified_deleted_and_bounded_output(self):
         added = unified_byte_diff("new.py", None, b"a\nb\n")
         modified = unified_byte_diff("app.py", b"a\n", b"b\n")

@@ -19,11 +19,19 @@ def _usage(data: dict[str, Any]) -> dict[str, int]:
     total_tokens = raw.get("total_tokens", input_tokens + output_tokens) or 0
     if not raw:
         return {}
-    return {
+    usage = {
         "input_tokens": int(input_tokens),
         "output_tokens": int(output_tokens),
         "total_tokens": int(total_tokens),
     }
+    if raw.get("prompt_cache_hit_tokens") is not None:
+        usage["prompt_cache_hit_tokens"] = int(raw["prompt_cache_hit_tokens"])
+    if raw.get("prompt_cache_miss_tokens") is not None:
+        usage["prompt_cache_miss_tokens"] = int(raw["prompt_cache_miss_tokens"])
+    details = raw.get("completion_tokens_details")
+    if isinstance(details, dict) and details.get("reasoning_tokens") is not None:
+        usage["reasoning_tokens"] = int(details["reasoning_tokens"])
+    return usage
 
 
 def _safe_text(text: str) -> str:

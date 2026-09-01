@@ -19,6 +19,11 @@ class TestEvidenceReport(unittest.TestCase):
         st.task_tool_calls = 5
         st.task_in_tok = 120
         st.task_out_tok = 30
+        st.task_cache_hit_tok = 90
+        st.task_cache_miss_tok = 30
+        st.task_reasoning_tok = 20
+        st.task_cache_usage_reported = True
+        st.task_reasoning_usage_reported = True
         st.step = 4
         st.note_evidence({"kind": "tool", "tool": "read_file", "path": "parser.py"})
         st.note_check_attempt(
@@ -41,6 +46,9 @@ class TestEvidenceReport(unittest.TestCase):
         self.assertEqual(report["metrics"]["tool_calls"], 5)
         self.assertEqual(report["metrics"]["checks"], 1)
         self.assertEqual(report["metrics"]["total_tokens"], 150)
+        self.assertEqual(report["metrics"]["prompt_cache_hit_tokens"], 90)
+        self.assertEqual(report["metrics"]["prompt_cache_miss_tokens"], 30)
+        self.assertEqual(report["metrics"]["reasoning_tokens"], 20)
         self.assertEqual(report["changed_files"][0]["path"], "parser.py")
         self.assertEqual(report["outcome"]["termination_reason"], "max_steps")
 
@@ -49,6 +57,22 @@ class TestEvidenceReport(unittest.TestCase):
         self.assertIn("Repair progress: failed", rendered)
         self.assertIn("parser.py", rendered)
         self.assertIn("Workspace revision", rendered)
+        self.assertIn("Prompt cache hit: 90", rendered)
+        self.assertIn("Reasoning tokens: 20", rendered)
+
+    def test_missing_provider_breakdown_is_reported_as_unavailable(self):
+        st = State(task_in_tok=10, task_out_tok=2)
+        report = build_evidence_report(
+            st,
+            changes=[],
+            final_text="done",
+            elapsed_seconds=0.1,
+        )
+
+        self.assertIsNone(report["metrics"]["prompt_cache_hit_tokens"])
+        self.assertIsNone(report["metrics"]["reasoning_tokens"])
+        rendered = report_markdown(report)
+        self.assertIn("Prompt cache hit: unavailable", rendered)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,12 @@ from .verification import (
 )
 from .workspace_state import WorkspaceDelta, WorkspaceSnapshot, WorkspaceTracker
 
+MAX_RECENT_FILE_EVIDENCE_CHARS = min(
+    34_000,
+    max(4_000, config.MAX_CONTEXT_CHARS * 9 // 16),
+)
+MAX_RECENT_FILE_EVIDENCE_RANGES = 12
+
 
 @dataclass
 class ToolRes:
@@ -62,6 +68,11 @@ class State:
     out_tok: int = 0
     task_in_tok: int = 0
     task_out_tok: int = 0
+    task_cache_hit_tok: int = 0
+    task_cache_miss_tok: int = 0
+    task_reasoning_tok: int = 0
+    task_cache_usage_reported: bool = False
+    task_reasoning_usage_reported: bool = False
     task_model_calls: int = 0
     task_tool_calls: int = 0
     check_attempts: list[dict[str, Any]] = field(default_factory=list)
@@ -84,6 +95,8 @@ class State:
     )
     checkpoints: Any = None
     read_observations: dict[str, tuple[str, int]] = field(default_factory=dict, repr=False)
+    inspected_ranges: dict[str, int] = field(default_factory=dict, repr=False)
+    recent_file_evidence: dict[str, str] = field(default_factory=dict, repr=False)
     workspace_tracker: WorkspaceTracker = field(default_factory=WorkspaceTracker, repr=False)
     workspace_tracking_complete: bool = True
     completed: bool = False
@@ -113,6 +126,11 @@ class State:
         self.start = time.time()
         self.task_in_tok = 0
         self.task_out_tok = 0
+        self.task_cache_hit_tok = 0
+        self.task_cache_miss_tok = 0
+        self.task_reasoning_tok = 0
+        self.task_cache_usage_reported = False
+        self.task_reasoning_usage_reported = False
         self.task_model_calls = 0
         self.task_tool_calls = 0
         self.check_attempts.clear()
@@ -124,6 +142,8 @@ class State:
         self.length_continuations = 0
         self.repetition.reset()
         self.clear_read_observations()
+        self.inspected_ranges.clear()
+        self.recent_file_evidence.clear()
         self.completed = False
         self.termination_reason = None
         self.turn_files.clear()
@@ -140,7 +160,7 @@ class State:
             len(self.checkpoints.active()) if self.checkpoints is not None else 0
         )
 
-    def note_planner_observation(self, tool_name: str) -> None:
+    def note_planner_observation(self, tool_name: str, args: dict | None = None) -> None:
         """Record process-local evidence used before the first plan this turn."""
 
         self.planner_observations.add(tool_name)
@@ -216,22 +236,32 @@ class State:
         })
         return self.repair_progress
 
-    def observe_read(self, key: str, digest: str) -> bool:
+    def observe_read(self, key: str, digest: str, payload: str) -> bool:
         """Remember a displayed file range and report a safe short-cache hit.
 
         The cache saves model-input tokens, not filesystem reads: ``read_file``
         still reads and hashes the current range before calling this method.
-        Entries are only reusable while their original tool group can still be
-        present in the bounded model view.
+        Exact recent evidence is retained in a separate bounded working set, so
+        a compact hit remains valid after its original tool group is pruned.
         """
 
+        self.inspected_ranges.pop(key, None)
+        self.inspected_ranges[key] = self.step
+        if len(self.inspected_ranges) > 24:
+            oldest = next(iter(self.inspected_ranges))
+            del self.inspected_ranges[oldest]
+            self.read_observations.pop(oldest, None)
+
+        already_retained = self._has_file_evidence(key)
         previous = self.read_observations.get(key)
-        if previous is not None and previous[0] == digest:
-            age = self.step - previous[1]
-            if 0 <= age <= max(1, config.MAX_GROUPS):
-                # Keep the original full-observation step. Compact hits must
-                # not extend the cache beyond that content's model-view life.
-                return True
+        if (
+            previous is not None
+            and previous[0] == digest
+            and already_retained
+        ):
+            self._remember_file_evidence(key, payload)
+            return True
+        self._remember_file_evidence(key, payload)
         self.read_observations[key] = (digest, self.step)
         return False
 
@@ -239,6 +269,93 @@ class State:
         """Forget short-cache entries when their full observations may be absent."""
 
         self.read_observations.clear()
+
+    def clear_file_evidence(self) -> None:
+        """Conservatively forget all file evidence after an incomplete scan."""
+
+        self.clear_read_observations()
+        self.inspected_ranges.clear()
+        self.recent_file_evidence.clear()
+
+    def inspected_ranges_text(self, *, limit: int = 12) -> str:
+        """Return a compact durable ledger without replaying source contents."""
+
+        if not self.inspected_ranges:
+            return "none"
+        keys = list(self.inspected_ranges)[-max(1, limit) :]
+        prefix = "…; " if len(self.inspected_ranges) > len(keys) else ""
+        return prefix + "; ".join(keys)
+
+    def retained_file_evidence_payloads(self) -> tuple[str, ...]:
+        """Identify exact read results whose original groups should stay visible."""
+
+        return tuple(self.recent_file_evidence.values())
+
+    def retain_visible_file_evidence(self, payloads: frozenset[str]) -> None:
+        """Drop evidence whose exact tool result was absent from the model request."""
+
+        for key, payload in list(self.recent_file_evidence.items()):
+            if payload not in payloads:
+                self.recent_file_evidence.pop(key, None)
+                self.read_observations.pop(key, None)
+
+    def _remember_file_evidence(self, key: str, payload: str) -> None:
+        """Keep a bounded LRU of non-duplicated file ranges for future requests."""
+
+        parsed = _read_range(key)
+        if parsed is None or not payload:
+            return
+        path, start, end = parsed
+        for existing_key in list(self.recent_file_evidence):
+            existing = _read_range(existing_key)
+            if existing is None or existing[0] != path:
+                continue
+            _, existing_start, existing_end = existing
+            if existing_start <= start and existing_end >= end:
+                value = self.recent_file_evidence.pop(existing_key)
+                self.recent_file_evidence[existing_key] = value
+                return
+            if start <= existing_start and end >= existing_end:
+                self.recent_file_evidence.pop(existing_key, None)
+
+        self.recent_file_evidence.pop(key, None)
+        self.recent_file_evidence[key] = payload
+        while (
+            len(self.recent_file_evidence) > MAX_RECENT_FILE_EVIDENCE_RANGES
+            or sum(len(value) for value in self.recent_file_evidence.values())
+            > MAX_RECENT_FILE_EVIDENCE_CHARS
+        ):
+            oldest = next(iter(self.recent_file_evidence))
+            self.recent_file_evidence.pop(oldest, None)
+
+    def _has_file_evidence(self, key: str) -> bool:
+        requested = _read_range(key)
+        if requested is None:
+            return False
+        path, start, end = requested
+        return any(
+            candidate is not None
+            and candidate[0] == path
+            and candidate[1] <= start
+            and candidate[2] >= end
+            for candidate in map(_read_range, self.recent_file_evidence)
+        )
+
+    def forget_inspected_paths(self, paths: list[str] | tuple[str, ...]) -> None:
+        """Invalidate ledger entries whose source files changed."""
+
+        prefixes = tuple(f"{path}:" for path in paths)
+        if not prefixes:
+            return
+        self.inspected_ranges = {
+            key: step
+            for key, step in self.inspected_ranges.items()
+            if not key.startswith(prefixes)
+        }
+        for key in list(self.recent_file_evidence):
+            if key.startswith(prefixes):
+                self.recent_file_evidence.pop(key, None)
+                self.read_observations.pop(key, None)
 
     @property
     def task_tokens(self) -> int:
@@ -328,6 +445,8 @@ class State:
         self.workspace_tracking_complete = (
             self.workspace_tracking_complete and delta.complete
         )
+        if not delta.complete:
+            self.clear_file_evidence()
         if delta.paths:
             self.note_workspace_changes(delta.paths)
         return delta
@@ -359,7 +478,7 @@ class State:
         self.external_change_possible = True
         self.files.update(changed)
         self.turn_files.update(changed)
-        self.clear_read_observations()
+        self.forget_inspected_paths(changed)
 
     def note_agent_edit(self, path: str) -> None:
         """Record one deliberate file-tool or checkpoint state transition."""
@@ -369,7 +488,7 @@ class State:
         self.changed = True
         self.files.add(path)
         self.turn_files.add(path)
-        self.clear_read_observations()
+        self.forget_inspected_paths([path])
 
     def note_shell_attempt(self, scan_complete: bool) -> None:
         """Invalidate verification after shell execution, even without file changes."""
@@ -377,6 +496,8 @@ class State:
         self.invalidate_verification()
         self.external_change_possible = True
         self.workspace_tracking_complete = self.workspace_tracking_complete and scan_complete
+        if not scan_complete:
+            self.clear_file_evidence()
 
     def runtime_context(self) -> str:
         """Return a deterministic, compact summary for every model request."""
@@ -427,4 +548,15 @@ class State:
             f"workspace tracking complete: {'yes' if self.workspace_tracking_complete else 'no (bounded/partial)'}"
             f"\ntask token budget: {self.task_budget_text()}"
             f"\n{self.plan.compact()}"
+            f"\ninspected file ranges: {self.inspected_ranges_text()}"
+            "\nexact recent file evidence: supplied separately as bounded read_file "
+            "tool results when available"
         )
+
+
+def _read_range(key: str) -> tuple[str, int, int] | None:
+    try:
+        path, start_text, end_text = key.rsplit(":", 2)
+        return path, int(start_text), int(end_text)
+    except (TypeError, ValueError):
+        return None

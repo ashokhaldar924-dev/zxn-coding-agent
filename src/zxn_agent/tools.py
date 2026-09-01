@@ -288,7 +288,7 @@ def read_file(args: dict, st: State) -> ToolRes:
             f"{outside_change}"
         )
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        if st.observe_read(f"{_relative(path)}:0:0", digest):
+        if st.observe_read(f"{_relative(path)}:0:0", digest, payload):
             return ToolRes(
                 f"{header}\n\n[unchanged: this exact range is already present in recent context.]"
             )
@@ -328,7 +328,7 @@ def read_file(args: dict, st: State) -> ToolRes:
         f"{header}\n\n" + "\n".join(shown) + f"\n\n{footer}{outside_change}"
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    if st.observe_read(f"{_relative(path)}:{start}:{end}", digest):
+    if st.observe_read(f"{_relative(path)}:{start}:{end}", digest, payload):
         return ToolRes(
             f"{header}\n\n"
             "[unchanged: this exact range is already present in recent context; "
@@ -1148,7 +1148,7 @@ def run_tool(name: str, args: dict, st: State) -> ToolRes:
         _ensure_workspace_tracking(st)
         result = REG[name](args, st)
         if result.ok and name in PLAN_INVESTIGATION_TOOLS:
-            st.note_planner_observation(name)
+            st.note_planner_observation(name, args)
         return result
     except (KeyError, TypeError, ValueError, PermissionError, OSError) as exc:
         return ToolRes(f"Tool error in {name}: {type(exc).__name__}: {exc}", ok=False)
@@ -1185,7 +1185,7 @@ CMD_PROPS = {
 }
 
 TOOL_SCHEMAS = [
-    _schema("read_file", "Read up to 200 numbered lines from a workspace text file. An unchanged repeated range returns a compact reuse notice while its earlier content remains in context.", {
+    _schema("read_file", "Read up to 200 numbered lines from a workspace text file. The Runtime retains a bounded exact working set, so an unchanged repeated range can return a compact reuse notice even after older conversation groups are pruned.", {
         "path": PATH,
         "start": {"type": "integer", "minimum": 1, "description": "First line, 1-based."},
         "end": {"type": "integer", "minimum": 1, "description": "Optional inclusive final line."},

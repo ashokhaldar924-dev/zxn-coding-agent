@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 import unittest
 
-from zxn_agent.gui import _approval_parts
-from zxn_agent.gui_presenter import GuiPresenter
+from zxn_agent.gui import _approval_parts, _outcome_html
+from zxn_agent.gui_presenter import GuiPresenter, OutcomeView, VerificationView
 
 
 def verification(current: bool, *, rev: int = 3, verified: int = 2) -> dict:
@@ -60,7 +60,7 @@ class TestGuiPresenter(unittest.TestCase):
         )
 
         titles = [item.title for item in self.presenter.activity]
-        self.assertEqual(titles, ["Fix parser", "Read src/parser.py:10-40"])
+        self.assertEqual(titles, ["Fix parser", "已读取 src/parser.py:10-40"])
         self.assertNotIn('"path"', "\n".join(titles))
 
     def test_plan_is_replaced_from_runtime_plan_event(self):
@@ -288,7 +288,7 @@ class TestGuiPresenter(unittest.TestCase):
         self.assertTrue(view.current)
         self.assertFalse(view.adequate)
         self.assertFalse(view.task_completed)
-        self.assertIn("Plan incomplete", self.presenter.activity[-1].detail[-1])
+        self.assertIn("计划未完成", self.presenter.activity[-1].detail[-1])
         self.assertEqual(
             sum(item.kind == "completion" for item in self.presenter.activity),
             1,
@@ -325,10 +325,19 @@ class TestGuiPresenter(unittest.TestCase):
                 "output_tokens": 20,
                 "repair_progress": "passed",
                 "termination_reason": "completed",
-                "report": {"metrics": {"total_tokens": 120}},
+                "report": {
+                    "metrics": {
+                        "total_tokens": 120,
+                        "prompt_tokens": 100,
+                        "completion_tokens": 20,
+                        "prompt_cache_hit_tokens": 70,
+                        "prompt_cache_miss_tokens": 30,
+                        "reasoning_tokens": 12,
+                    }
+                },
             }
         )
-        self.assertEqual(self.presenter.activity[-1].title, "Completed")
+        self.assertEqual(self.presenter.activity[-1].title, "任务完成")
         self.assertEqual(self.presenter.final_changes[0].path, "service.py")
         self.assertTrue(self.presenter.verification.current)
         self.assertEqual(self.presenter.outcome.status, "final_verified")
@@ -337,6 +346,11 @@ class TestGuiPresenter(unittest.TestCase):
         self.assertEqual(self.presenter.outcome.tool_calls, 8)
         self.assertEqual(self.presenter.outcome.checks, 2)
         self.assertEqual(self.presenter.outcome.tokens, 120)
+        self.assertEqual(self.presenter.outcome.prompt_tokens, 100)
+        self.assertEqual(self.presenter.outcome.completion_tokens, 20)
+        self.assertEqual(self.presenter.outcome.cache_hit_tokens, 70)
+        self.assertEqual(self.presenter.outcome.cache_miss_tokens, 30)
+        self.assertEqual(self.presenter.outcome.reasoning_tokens, 12)
         self.assertIsNotNone(self.presenter.evidence_report)
 
     def test_stopped_outcome_never_becomes_final_verified(self):
@@ -439,9 +453,35 @@ class TestGuiPresenter(unittest.TestCase):
             "Choose [1/2/3]: "
         )
         self.assertIn("python -m pytest tests -q", body)
-        self.assertEqual(options["1"], "Allow once")
-        self.assertIn("command family", options["2"])
-        self.assertEqual(options["3"], "Deny")
+        self.assertEqual(options["1"], "仅允许一次")
+        self.assertIn("命令系列", options["2"])
+        self.assertEqual(options["3"], "拒绝")
+
+    def test_outcome_card_uses_chinese_product_labels(self):
+        outcome = OutcomeView(
+            visible=True,
+            completed=True,
+            status="final_verified",
+            changed_files=2,
+            model_calls=3,
+            tool_calls=4,
+            checks=1,
+            tokens=1200,
+            repair_progress="passed",
+        )
+        state = VerificationView(
+            workspace_revision=2,
+            verified_revision=2,
+            fingerprint_matched=True,
+            verified_scope="full",
+        )
+
+        rendered = _outcome_html(outcome, state)
+
+        for text in ("任务完成", "最终验证通过", "改动文件", "模型调用", "全量"):
+            self.assertIn(text, rendered)
+        self.assertNotIn("Task Completed", rendered)
+        self.assertNotIn("FINAL VERIFIED", rendered)
 
 
 if __name__ == "__main__":

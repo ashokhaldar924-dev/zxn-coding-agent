@@ -63,6 +63,27 @@ class TestLLM(unittest.TestCase):
         self.assertEqual(captured["json"]["tool_choice"], "auto")
         self.assertEqual(set(captured["json"]), {"model", "messages", "tools", "tool_choice"})
 
+    def test_deepseek_usage_breakdown_is_preserved(self):
+        def post(url, **kwargs):
+            return FakeResponse(data={
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "prompt_cache_hit_tokens": 75,
+                    "prompt_cache_miss_tokens": 25,
+                    "completion_tokens": 30,
+                    "completion_tokens_details": {"reasoning_tokens": 22},
+                    "total_tokens": 130,
+                },
+            })
+
+        with self.install_fake(post):
+            _, usage = llm.call([], [])
+
+        self.assertEqual(usage["prompt_cache_hit_tokens"], 75)
+        self.assertEqual(usage["prompt_cache_miss_tokens"], 25)
+        self.assertEqual(usage["reasoning_tokens"], 22)
+
     def test_retries_transient_status_twice(self):
         responses = [FakeResponse(429), FakeResponse(503), FakeResponse(data={
             "choices": [{"message": {"content": "recovered"}}],

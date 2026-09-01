@@ -19,7 +19,8 @@
 - 区分验证新鲜度与充分性；用户明确要求全部测试时，局部测试通过不能打开最终门禁。
 - 对连续失败的 `check_command` 建立去噪指纹；相同失败三次未推进时明确以 `NO_PROGRESS` 停止。
 - 最终结果、Plan Evidence、恢复和报告都来自 Runtime 事实，不根据模型总结猜测完成状态。
-- 对工具 schema、输出预留、长结果和历史上下文统一做有界处理，支持可选的任务 Token 预算。
+- 对工具 schema、输出预留、长结果和历史上下文统一做有界处理；近期精确源码观察会作为限额工具证据保留，文件变化后立即失效，减少裁剪后的重复读取。
+- Evidence Report 在 provider 支持时拆分输入、输出、缓存命中、缓存未命中和推理 Token；缺失字段不会被伪造为 0。
 
 ## Quick start
 
@@ -103,7 +104,7 @@ zxn-agent --gui --workspace "D:\path\to\project"
 
 界面左侧提供当前工作区的只读项目树和本轮 Changes，中间显示任务、工具、文件变化与命令摘要，右侧固定显示 Plan 和 Runtime Verification。顶部可以切换或重新打开最近工作区，并从本地 Session History 恢复任务；底部直接输入自然语言任务。Plan 下方的 Evidence 只引用真实工具事件。
 
-运行期间 `Run` 会切换为 `Stop`。停止请求会中止正在执行的普通命令进程树，忽略尚未返回的模型响应，并把任务明确标记为 `STOPPED`，不会把最近一次局部或历史验证渲染成 `FINAL VERIFIED`。文件预览是只读的；Changes 中的 Diff 只来自 Checkpoint 保存的 before-image 与当前文件，不会根据日志或模型文本猜测内容。`Restore` 只撤销本轮由文件工具造成且未被外部改写的变化，`Export` 导出由 Runtime 生成的 Evidence Report；恢复后旧验证立即失效。
+运行期间“运行”会切换为“停止”。停止请求会中止正在执行的普通命令进程树，忽略尚未返回的模型响应，并把任务明确标记为已停止，不会把最近一次局部或历史验证渲染成“最终验证通过”。文件预览是只读的；“改动”中的差异只来自 Checkpoint 保存的 before-image 与当前文件，不会根据日志或模型文本猜测内容。“恢复”只撤销本轮由文件工具造成且未被外部改写的变化，“导出”输出由 Runtime 生成的 Evidence Report；恢复后旧验证立即失效。
 
 ## Runtime
 

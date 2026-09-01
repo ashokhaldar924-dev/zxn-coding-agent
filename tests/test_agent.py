@@ -31,6 +31,10 @@ def tools_message(*calls: dict) -> dict:
     return {"content": "", "tool_calls": list(calls)}
 
 
+def request_text(messages: list[dict]) -> str:
+    return "\n".join(str(message.get("content") or "") for message in messages)
+
+
 class FakeLLM:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -103,7 +107,79 @@ class TestAgentLoop(unittest.TestCase):
         self.assertTrue(st.completed)
         self.assertEqual(st.plan.items, [])
         self.assertEqual(len(fake.messages), 2)
-        self.assertEqual(fake.messages[1][-1]["role"], "tool")
+        self.assertTrue(any(message.get("role") == "tool" for message in fake.messages[1]))
+
+    def test_read_only_investigation_has_no_round_budget_or_warning(self):
+        names = tuple(f"module_{index}.py" for index in range(8))
+        for name in names:
+            Path(self.tmpdir, name).write_text(f"# {name}\n", encoding="utf-8")
+        fake = FakeLLM([
+            tools_message(call(f"read-{index}", "read_file", {"path": name}))
+            for index, name in enumerate(names, 1)
+        ] + [{"content": "Analysis complete."}])
+
+        final, _st, _ = self.run_agent(fake)
+
+        self.assertEqual(final, "Analysis complete.")
+        self.assertFalse(any(
+            event.get("event") == "investigation_nudge"
+            for event in self.logger.events
+        ))
+        self.assertFalse(any(
+            event.get("block_kind") == "investigation_stagnation"
+            for event in self.logger.events
+        ))
+
+    def test_old_read_group_is_rehydrated_as_exact_tool_evidence(self):
+        Path(self.tmpdir, "source.py").write_text(
+            "UNIQUE_RETAINED_SOURCE = 42\n",
+            encoding="utf-8",
+        )
+        directory_names = [f"dir_{index}" for index in range(config.MAX_GROUPS + 1)]
+        for name in directory_names:
+            Path(self.tmpdir, name).mkdir()
+
+        original = tools_message(call("original-read", "read_file", {"path": "source.py"}))
+        original["reasoning_content"] = "actual retained reasoning"
+        fake = FakeLLM([
+            original,
+            *[
+                tools_message(call(f"list-{index}", "list_dir", {"path": name}))
+                for index, name in enumerate(directory_names)
+            ],
+            {"content": "Evidence retained; no reread needed."},
+        ])
+
+        final, st, _ = self.run_agent(fake)
+
+        self.assertEqual(final, "Evidence retained; no reread needed.")
+        self.assertTrue(st.completed)
+        messages = fake.messages[-1]
+        self.assertNotIn("UNIQUE_RETAINED_SOURCE", messages[0]["content"])
+        self.assertTrue(any(
+            message.get("role") == "tool"
+            and "UNIQUE_RETAINED_SOURCE" in str(message.get("content"))
+            for message in messages
+        ))
+        call_ids = {
+            call.get("id")
+            for message in messages
+            for call in message.get("tool_calls", [])
+        }
+        self.assertIn("original-read", call_ids)
+        self.assertFalse(any(str(call_id).startswith("runtime-retained") for call_id in call_ids))
+        retained_assistant = next(
+            message
+            for message in messages
+            if any(
+                call.get("id") == "original-read"
+                for call in message.get("tool_calls", [])
+            )
+        )
+        self.assertEqual(
+            retained_assistant["reasoning_content"],
+            "actual retained reasoning",
+        )
 
     def test_user_stop_during_model_wait_returns_without_accepting_response(self):
         cancel = threading.Event()
@@ -162,7 +238,11 @@ class TestAgentLoop(unittest.TestCase):
         fake = FakeLLM([first, {"content": "Done."}])
         final, _, _ = self.run_agent(fake)
         self.assertEqual(final, "Done.")
-        assistant = fake.messages[1][-2]
+        assistant = next(
+            message
+            for message in fake.messages[1]
+            if message.get("reasoning_content") == "private reasoning state"
+        )
         self.assertEqual(assistant["role"], "assistant")
         self.assertEqual(assistant["reasoning_content"], "private reasoning state")
 
@@ -188,8 +268,8 @@ class TestAgentLoop(unittest.TestCase):
         self.assertEqual(final, "Recovered and verified.")
         self.assertEqual(path.read_text(encoding="utf-8"), "new")
         self.assertEqual((st.rev, st.ok_rev), (1, 1))
-        self.assertEqual(fake.messages[1][-1]["role"], "tool")
-        self.assertIn("output limit", fake.messages[1][-1]["content"])
+        self.assertTrue(any(message.get("role") == "tool" for message in fake.messages[1]))
+        self.assertIn("output limit", request_text(fake.messages[1]))
         self.assertTrue(any(
             event.get("event") == "model_protocol_issue"
             and event.get("finish_reason") == "length"
@@ -268,7 +348,7 @@ class TestAgentLoop(unittest.TestCase):
         self.assertEqual(final, "Done.")
         self.assertEqual((st.rev, st.ok_rev), (1, 1))
 
-    def test_incomplete_plan_is_visible_but_does_not_replace_final_verification(self):
+    def test_plan_sync_is_requested_after_progress_and_closed_only_after_final_gate(self):
         Path(self.tmpdir, "a.txt").write_text("old", encoding="utf-8")
         check = {"cmd": f'"{sys.executable}" -c "print(1)"'}
         fake = FakeLLM([
@@ -289,10 +369,19 @@ class TestAgentLoop(unittest.TestCase):
 
         self.assertEqual(final, "Done with objective verification.")
         self.assertEqual((st.rev, st.ok_rev), (1, 1))
-        self.assertEqual(st.plan.completed, 0)
+        self.assertEqual(st.plan.completed, 2)
+        self.assertIn("Runtime plan sync", request_text(fake.messages[2]))
+        self.assertTrue(
+            any(
+                message.get("role") == "user"
+                and "Runtime plan sync" in str(message.get("content") or "")
+                for message in fake.messages[2]
+            )
+        )
         events = [event for event in self.logger.events if event["event"] == "plan_update"]
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["plan"], st.plan.to_data())
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[-1]["source"], "runtime_verified_finish")
+        self.assertEqual(events[-1]["plan"], st.plan.to_data())
 
     def test_unverified_final_is_rejected_then_can_recover(self):
         Path(self.tmpdir, "a.txt").write_text("old", encoding="utf-8")
@@ -304,7 +393,7 @@ class TestAgentLoop(unittest.TestCase):
         ])
         final, st, _ = self.run_agent(fake)
         self.assertEqual(final, "Actually done.")
-        self.assertIn("has not been successfully verified", fake.messages[2][-1]["content"])
+        self.assertIn("has not been successfully verified", request_text(fake.messages[2]))
         self.assertEqual((st.rev, st.ok_rev), (1, 1))
 
     def test_edit_after_check_invalidates_old_verification(self):
@@ -320,7 +409,7 @@ class TestAgentLoop(unittest.TestCase):
         ])
         final, st, _ = self.run_agent(fake)
         self.assertEqual(final, "Done after recheck.")
-        self.assertIn("has not been successfully verified", fake.messages[4][-1]["content"])
+        self.assertIn("has not been successfully verified", request_text(fake.messages[4]))
         self.assertEqual((st.rev, st.ok_rev), (2, 2))
 
     def test_failed_verification_then_fix_reverify_and_finish(self):
@@ -373,8 +462,8 @@ class TestAgentLoop(unittest.TestCase):
         ])
         final, st, _ = self.run_agent(fake, st)
         self.assertEqual(final, "Done with required verifier.")
-        self.assertIn("did not satisfy", fake.messages[2][-1]["content"])
-        self.assertIn("has not been successfully verified", fake.messages[3][-1]["content"])
+        self.assertIn("did not satisfy", request_text(fake.messages[2]))
+        self.assertIn("has not been successfully verified", request_text(fake.messages[3]))
         self.assertEqual(st.ok_rev, st.rev)
 
     def test_explicit_full_suite_requirement_rejects_targeted_check(self):
@@ -402,7 +491,7 @@ class TestAgentLoop(unittest.TestCase):
         self.assertTrue(st.completed)
         self.assertTrue(st.verification_adequate())
         self.assertEqual(st.verified_scope, "full")
-        self.assertIn("full test suite", fake.messages[3][-1]["content"])
+        self.assertIn("full test suite", request_text(fake.messages[3]))
         checks = [
             event for event in self.logger.events
             if event.get("event") == "tool_result" and event.get("name") == "check_command"
@@ -436,7 +525,7 @@ class TestAgentLoop(unittest.TestCase):
         self.assertEqual(st.rev, 2)
         self.assertEqual(st.files, {"a.txt"})
         self.assertEqual(st.ok_rev, st.rev)
-        self.assertIn("has not been successfully verified", fake.messages[4][-1]["content"])
+        self.assertIn("has not been successfully verified", request_text(fake.messages[4]))
         shell_result = next(
             event
             for event in self.logger.events
@@ -467,7 +556,10 @@ class TestAgentLoop(unittest.TestCase):
         self.assertEqual(final, "Done after verifying the current workspace.")
         self.assertEqual(path.read_text(encoding="utf-8"), "changed outside")
         self.assertEqual((st.rev, st.ok_rev), (2, 2))
-        self.assertIn("changed after the last successful verification", fake.messages[3][-1]["content"])
+        self.assertIn(
+            "changed after the last successful verification",
+            request_text(fake.messages[3]),
+        )
         self.assertTrue(any(
             event.get("event") == "workspace_reconcile"
             and event.get("changed_files") == ["a.txt"]
@@ -481,7 +573,7 @@ class TestAgentLoop(unittest.TestCase):
         ])
         final, st, _ = self.run_agent(fake)
         self.assertEqual(final, "Recovered.")
-        self.assertIn("Could not parse tool arguments", fake.messages[1][-1]["content"])
+        self.assertIn("Could not parse tool arguments", request_text(fake.messages[1]))
         self.assertEqual(st.errs, 1)
 
     def test_user_rejections_are_observations_not_errors(self):
@@ -539,13 +631,24 @@ class TestAgentLoop(unittest.TestCase):
         budget_fake = FakeLLM([
             (
                 tools_message(call("budget", "read_file", {"path": "budget.txt"})),
-                {"input_tokens": 7, "output_tokens": 4},
+                {
+                    "input_tokens": 7,
+                    "output_tokens": 4,
+                    "prompt_cache_hit_tokens": 5,
+                    "prompt_cache_miss_tokens": 2,
+                    "reasoning_tokens": 3,
+                },
             ),
             {"content": "must not be requested"},
         ])
         final, budget_state, _ = self.run_agent(budget_fake)
         self.assertIn("task token budget (11/10)", final)
         self.assertEqual(budget_state.task_tokens, 11)
+        self.assertTrue(budget_state.task_cache_usage_reported)
+        self.assertEqual(budget_state.task_cache_hit_tok, 5)
+        self.assertEqual(budget_state.task_cache_miss_tok, 2)
+        self.assertTrue(budget_state.task_reasoning_usage_reported)
+        self.assertEqual(budget_state.task_reasoning_tok, 3)
         self.assertEqual(len(budget_fake.messages), 1)
 
         config.MAX_TASK_TOKENS = 20
@@ -558,7 +661,7 @@ class TestAgentLoop(unittest.TestCase):
         ])
         final, _, _ = self.run_agent(warning_fake)
         self.assertEqual(final, "Finished within budget.")
-        self.assertIn("approaching limit", warning_fake.messages[1][0]["content"])
+        self.assertIn("approaching limit", request_text(warning_fake.messages[1]))
 
     def test_ctrl_c_is_a_controlled_stop(self):
         fake = FakeLLM([KeyboardInterrupt()])
@@ -576,7 +679,7 @@ class TestAgentLoop(unittest.TestCase):
         ])
         final, st, _ = self.run_agent(fake)
         self.assertEqual(final, "Changed approach.")
-        self.assertIn("Stagnation guard blocked", fake.messages[3][-1]["content"])
+        self.assertIn("Stagnation guard blocked", request_text(fake.messages[3]))
         self.assertEqual(st.errs, 0)
         self.assertTrue(any(
             event["event"] == "tool_block" and event["block_kind"] == "stagnation"

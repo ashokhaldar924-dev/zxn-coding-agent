@@ -14,7 +14,7 @@ from unittest import mock
 
 from zxn_agent import config, tools
 from zxn_agent.gitguard import GitGuard
-from zxn_agent.state import State
+from zxn_agent.state import MAX_RECENT_FILE_EVIDENCE_RANGES, State
 
 
 class TestTools(unittest.TestCase):
@@ -103,6 +103,7 @@ class TestTools(unittest.TestCase):
         repeated = self.run_tool("read_file", {"path": "lines.txt", "start": 11, "end": 13})
         self.assertIn("unchanged", repeated.text)
         self.assertNotIn("11 | line 11", repeated.text)
+        self.assertIn("lines.txt:11:13", self.st.inspected_ranges_text())
         for step in range(1, config.MAX_GROUPS + 1):
             self.st.step = step
             still_recent = self.run_tool(
@@ -110,9 +111,15 @@ class TestTools(unittest.TestCase):
             )
             self.assertIn("unchanged", still_recent.text)
         self.st.step = config.MAX_GROUPS + 1
-        expired = self.run_tool("read_file", {"path": "lines.txt", "start": 11, "end": 13})
-        self.assertIn("11 | line 11", expired.text)
-        self.assertNotIn("unchanged", expired.text)
+        retained = self.run_tool("read_file", {"path": "lines.txt", "start": 11, "end": 13})
+        self.assertIn("unchanged", retained.text)
+        self.assertNotIn("11 | line 11", retained.text)
+        self.assertIn("11 | line 11", str(self.st.retained_file_evidence_payloads()))
+        self.st.clear_read_observations()
+        self.assertIn("lines.txt:11:13", self.st.inspected_ranges_text())
+        replayed = self.run_tool("read_file", {"path": "lines.txt", "start": 11, "end": 13})
+        self.assertIn("11 | line 11", replayed.text)
+        self.assertNotIn("unchanged", replayed.text)
         path = Path(self.tmpdir, "lines.txt")
         path.write_text(
             path.read_text(encoding="utf-8").replace("line 12", "changed 12"),
@@ -125,6 +132,53 @@ class TestTools(unittest.TestCase):
         self.assertIn("1-200 / 250", capped.text)
         self.assertIn("capped at 200", capped.text)
         self.assertNotIn("201 |", capped.text)
+
+    def test_unrelated_edit_keeps_exact_read_evidence_reusable(self):
+        Path(self.tmpdir, "observed.py").write_text("answer = 42\n", encoding="utf-8")
+        Path(self.tmpdir, "other.py").write_text("before\n", encoding="utf-8")
+        first = self.run_tool("read_file", {"path": "observed.py"})
+        self.assertIn("answer = 42", first.text)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            changed = self.run_tool(
+                "edit_file",
+                {"path": "other.py", "old": "before", "new": "after"},
+            )
+        self.assertTrue(changed.ok)
+
+        repeated = self.run_tool("read_file", {"path": "observed.py"})
+        self.assertIn("unchanged", repeated.text)
+        self.assertIn("answer = 42", str(self.st.retained_file_evidence_payloads()))
+
+    def test_exact_read_evidence_has_a_strict_range_bound(self):
+        for index in range(MAX_RECENT_FILE_EVIDENCE_RANGES + 3):
+            name = f"evidence_{index}.py"
+            Path(self.tmpdir, name).write_text(f"value = {index}\n", encoding="utf-8")
+            self.run_tool("read_file", {"path": name})
+
+        self.assertLessEqual(
+            len(self.st.recent_file_evidence),
+            MAX_RECENT_FILE_EVIDENCE_RANGES,
+        )
+        rendered = str(self.st.retained_file_evidence_payloads())
+        self.assertNotIn("evidence_0.py", rendered)
+        self.assertIn(
+            f"evidence_{MAX_RECENT_FILE_EVIDENCE_RANGES + 2}.py",
+            rendered,
+        )
+        evicted = self.run_tool("read_file", {"path": "evidence_0.py"})
+        self.assertIn("value = 0", evicted.text)
+        self.assertNotIn("unchanged", evicted.text)
+
+    def test_incomplete_workspace_scan_discards_all_retained_source(self):
+        Path(self.tmpdir, "observed.py").write_text("safe = True\n", encoding="utf-8")
+        self.run_tool("read_file", {"path": "observed.py"})
+        self.assertTrue(self.st.recent_file_evidence)
+
+        self.st.note_shell_attempt(scan_complete=False)
+
+        self.assertFalse(self.st.recent_file_evidence)
+        self.assertEqual(self.st.inspected_ranges_text(), "none")
 
     def test_read_truncates_one_huge_line_without_losing_continuation_metadata(self):
         Path(self.tmpdir, "minified.js").write_text(

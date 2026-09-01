@@ -147,12 +147,24 @@ def _trajectory_metrics(workspace: Path) -> dict:
         if event.get("event") == "tool_result" and event.get("name") == "check_command"
     ]
     first_successful = next((event for event in checks if event.get("rc") == 0), None)
-    usage_tokens = sum(
-        int((event.get("usage") or {}).get("input_tokens", (event.get("usage") or {}).get("prompt_tokens", 0)) or 0)
-        + int((event.get("usage") or {}).get("output_tokens", (event.get("usage") or {}).get("completion_tokens", 0)) or 0)
+    usages = [
+        event.get("usage") or {}
         for event in events
         if event.get("event") == "model_response"
+    ]
+    prompt_tokens = sum(
+        int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+        for usage in usages
     )
+    completion_tokens = sum(
+        int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+        for usage in usages
+    )
+    cache_usage_reported = any(
+        "prompt_cache_hit_tokens" in usage or "prompt_cache_miss_tokens" in usage
+        for usage in usages
+    )
+    reasoning_usage_reported = any("reasoning_tokens" in usage for usage in usages)
     return {
         "trajectory": str(path.relative_to(workspace)),
         "tool_calls": sum(event.get("event") == "tool_call" for event in events),
@@ -180,8 +192,25 @@ def _trajectory_metrics(workspace: Path) -> dict:
             [int(event.get("step", 0)) for event in events if event.get("event") == "model_response"],
             default=0,
         ),
-        "tokens": usage_tokens or (
+        "tokens": prompt_tokens + completion_tokens or (
             int(final.get("input_tokens", 0)) + int(final.get("output_tokens", 0))
+        ),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "prompt_cache_hit_tokens": (
+            sum(int(usage.get("prompt_cache_hit_tokens", 0) or 0) for usage in usages)
+            if cache_usage_reported
+            else None
+        ),
+        "prompt_cache_miss_tokens": (
+            sum(int(usage.get("prompt_cache_miss_tokens", 0) or 0) for usage in usages)
+            if cache_usage_reported
+            else None
+        ),
+        "reasoning_tokens": (
+            sum(int(usage.get("reasoning_tokens", 0) or 0) for usage in usages)
+            if reasoning_usage_reported
+            else None
         ),
         "changed_files": final.get("files", []),
         "final_revision": final.get("revision"),

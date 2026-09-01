@@ -60,6 +60,36 @@ class TestGitGuard(unittest.TestCase):
         self.assertEqual(guard.initial_dirty, set())
         self.assertIsNone(guard.head)
 
+    def test_scan_excludes_private_agent_runtime_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir).resolve()
+            root_result = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=str(repo) + "\n", stderr=""
+            )
+            head_result = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="abc123\n", stderr=""
+            )
+            status_result = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=(
+                    "?? .agent/run.jsonl\0"
+                    "?? .agent/sessions/session.jsonl\0"
+                    " M inventory/service.py\0"
+                ),
+                stderr="",
+            )
+            with mock.patch(
+                "zxn_agent.gitguard.subprocess.run",
+                side_effect=[root_result, head_result, status_result],
+            ):
+                guard = GitGuard.scan(repo)
+
+            self.assertEqual(
+                guard.display_paths(repo),
+                ["inventory/service.py"],
+            )
+
     def test_display_paths_omits_dirty_files_outside_workspace(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)

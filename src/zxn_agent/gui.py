@@ -29,7 +29,16 @@ from .log import RunLog
 from .session import SessionStore
 
 try:
-    from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
+    from PySide6.QtCore import (
+        QFileSystemWatcher,
+        QObject,
+        Qt,
+        QThread,
+        QTimer,
+        QUrl,
+        Signal,
+        Slot,
+    )
     from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
     from PySide6.QtWidgets import (
         QApplication,
@@ -72,6 +81,8 @@ COLORS = {
 
 
 if QObject is not None:
+
+    PROJECT_NODE_PATH_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 
     class ApprovalTicket:
         """One blocking permission question bridged safely to the GUI thread."""
@@ -123,11 +134,11 @@ if QObject is not None:
 
         def _confirm_resume(self, expected: str, actual: str) -> bool:
             answer = self._answer(
-                "Session Git base changed.\n\n"
-                f"Expected: {expected[:12]}\nCurrent:  {actual[:12]}\n\n"
-                "  [1] Resume against current codebase\n"
-                "  [2] Resume against current codebase\n"
-                "  [3] Cancel resume\n"
+                "会话的 Git 基线已变化。\n\n"
+                f"原基线：{expected[:12]}\n当前基线：{actual[:12]}\n\n"
+                "  [1] 在当前代码上恢复会话\n"
+                "  [2] 在当前代码上恢复会话\n"
+                "  [3] 取消恢复\n"
                 "Choose [1/2/3]: "
             )
             return answer in {"1", "2"}
@@ -173,7 +184,7 @@ if QObject is not None:
                 self.event_emitted.emit(
                     {
                         "event": "gui_error",
-                        "message": f"Could not run task: {type(exc).__name__}: {exc}",
+                        "message": f"无法运行任务：{type(exc).__name__}: {exc}",
                     }
                 )
                 code = 1
@@ -196,6 +207,12 @@ if QObject is not None:
             self._run_started_at = 0.0
             self._all_project_entries: list[ProjectEntry] = []
             self._build()
+            self._project_watcher = QFileSystemWatcher(self)
+            self._project_watcher.directoryChanged.connect(self._schedule_project_refresh)
+            self._project_refresh_timer = QTimer(self)
+            self._project_refresh_timer.setSingleShot(True)
+            self._project_refresh_timer.setInterval(150)
+            self._project_refresh_timer.timeout.connect(self._refresh_project_files)
             try:
                 self.recent_store.remember(config.WORKSPACE_DIR)
             except (OSError, WorkspaceDataError):
@@ -221,15 +238,15 @@ if QObject is not None:
             self.workspace_label.setAlignment(Qt.AlignmentFlag.AlignRight)
             self.model_label = QLabel(config.MODEL_NAME)
             self.model_label.setObjectName("workspace")
-            self.status_label = QLabel("● Ready")
+            self.status_label = QLabel("● 就绪")
             self.status_label.setObjectName("status")
-            self.open_button = QPushButton("Open Workspace")
+            self.open_button = QPushButton("打开工作区")
             self.open_button.setObjectName("headerButton")
             self.open_button.clicked.connect(self._open_workspace)
-            self.recent_button = QPushButton("Recent")
+            self.recent_button = QPushButton("最近使用")
             self.recent_button.setObjectName("headerButton")
             self.recent_button.clicked.connect(self._open_recent_workspace)
-            self.history_button = QPushButton("History")
+            self.history_button = QPushButton("历史记录")
             self.history_button.setObjectName("headerButton")
             self.history_button.clicked.connect(self._show_history)
             header.addWidget(title)
@@ -247,11 +264,11 @@ if QObject is not None:
             project_panel.setObjectName("projectPanel")
             project_layout = QVBoxLayout(project_panel)
             project_layout.setContentsMargins(12, 14, 12, 14)
-            project_title = QLabel("PROJECT")
+            project_title = QLabel("项目")
             project_title.setObjectName("sectionTitle")
             project_layout.addWidget(project_title)
             self.file_filter = QLineEdit()
-            self.file_filter.setPlaceholderText("Filter files…  Ctrl+P")
+            self.file_filter.setPlaceholderText("筛选文件…  Ctrl+P")
             self.file_filter.textChanged.connect(self._filter_project_files)
             project_layout.addWidget(self.file_filter)
             self.project_tree = QTreeWidget()
@@ -259,7 +276,7 @@ if QObject is not None:
             self.project_tree.setObjectName("projectTree")
             self.project_tree.itemActivated.connect(self._open_project_item)
             project_layout.addWidget(self.project_tree, 3)
-            changes_title = QLabel("CHANGES")
+            changes_title = QLabel("改动")
             changes_title.setObjectName("sectionTitle")
             project_layout.addWidget(changes_title)
             self.changes_list = QListWidget()
@@ -267,12 +284,12 @@ if QObject is not None:
             self.changes_list.itemActivated.connect(self._open_change_item)
             project_layout.addWidget(self.changes_list, 2)
             change_actions = QHBoxLayout()
-            self.restore_button = QPushButton("Restore")
-            self.restore_button.setToolTip("Restore direct Agent file changes from this task")
+            self.restore_button = QPushButton("恢复")
+            self.restore_button.setToolTip("恢复本次任务由 Agent 文件工具造成的改动")
             self.restore_button.clicked.connect(self._restore_task_changes)
             self.restore_button.setEnabled(False)
-            self.export_button = QPushButton("Export")
-            self.export_button.setToolTip("Export the Runtime evidence report")
+            self.export_button = QPushButton("导出")
+            self.export_button.setToolTip("导出 Runtime 证据报告")
             self.export_button.clicked.connect(self._export_evidence_report)
             self.export_button.setEnabled(False)
             change_actions.addWidget(self.restore_button)
@@ -293,7 +310,7 @@ if QObject is not None:
             side_layout.setContentsMargins(18, 16, 18, 16)
             side_layout.setSpacing(20)
 
-            self.plan_title = QLabel("Plan")
+            self.plan_title = QLabel("计划")
             self.plan_title.setObjectName("sectionTitle")
             side_layout.addWidget(self.plan_title)
             self.plan_host = QWidget()
@@ -308,7 +325,7 @@ if QObject is not None:
             separator.setFrameShape(QFrame.Shape.HLine)
             separator.setObjectName("separator")
             side_layout.addWidget(separator)
-            verification_title = QLabel("Verification")
+            verification_title = QLabel("验证")
             verification_title.setObjectName("sectionTitle")
             side_layout.addWidget(verification_title)
             self.verification = QLabel()
@@ -329,7 +346,7 @@ if QObject is not None:
             self.task_input.setPlaceholderText("输入编程任务…  (Ctrl+Enter 运行)")
             self.task_input.setMaximumHeight(92)
             self.task_input.setObjectName("taskInput")
-            self.run_button = QPushButton("Run")
+            self.run_button = QPushButton("运行")
             self.run_button.setObjectName("runButton")
             self.run_button.setMinimumSize(96, 46)
             self.run_button.clicked.connect(self._run_or_stop)
@@ -399,9 +416,9 @@ if QObject is not None:
                 return
             if time.monotonic() - self._run_started_at < 0.25:
                 return
-            self.run_button.setText("Stopping…")
+            self.run_button.setText("正在停止…")
             self.run_button.setEnabled(False)
-            self.status_label.setText("■ Stopping")
+            self.status_label.setText("■ 正在停止")
             self._worker.request_stop()
 
         @Slot(object)
@@ -423,20 +440,20 @@ if QObject is not None:
             prompt = _redact(ticket.prompt)
             body, options = _approval_parts(prompt)
             box = QMessageBox(self)
-            box.setWindowTitle("Permission required")
+            box.setWindowTitle("需要确认")
             box.setIcon(QMessageBox.Icon.Warning)
             box.setText(body)
-            box.setInformativeText("This approval applies only to the current Agent process.")
+            box.setInformativeText("本次授权仅在当前 Agent 进程中有效。")
             buttons: dict[Any, str] = {}
             for number in ("1", "2", "3"):
-                label = options.get(number, "Deny" if number == "3" else f"Option {number}")
+                label = options.get(number, "拒绝" if number == "3" else f"选项 {number}")
                 role = (
                     QMessageBox.ButtonRole.RejectRole
                     if number == "3"
                     else QMessageBox.ButtonRole.AcceptRole
                 )
                 buttons[box.addButton(label, role)] = number
-            stop_button = box.addButton("Stop task", QMessageBox.ButtonRole.DestructiveRole)
+            stop_button = box.addButton("停止任务", QMessageBox.ButtonRole.DestructiveRole)
             box.exec()
             if box.clickedButton() is stop_button:
                 self._request_stop()
@@ -449,7 +466,7 @@ if QObject is not None:
             self.active = active
             if code != 0 and not any(item.tone == "failure" for item in self.presenter.activity[-3:]):
                 self.presenter.consume(
-                    {"event": "gui_error", "message": "The Agent stopped because of a runtime error."}
+                    {"event": "gui_error", "message": "Agent 因运行时错误而停止。"}
                 )
                 self._render_all()
 
@@ -475,18 +492,18 @@ if QObject is not None:
             self.export_button.setEnabled(
                 not running and self.presenter.evidence_report is not None
             )
-            self.run_button.setText("Stop" if running else "Run")
-            self.status_label.setText("● Running" if running else self._idle_status())
+            self.run_button.setText("停止" if running else "运行")
+            self.status_label.setText("● 运行中" if running else self._idle_status())
             if not running:
                 self.task_input.setFocus()
 
         def _idle_status(self) -> str:
             state = self.presenter.verification
             if state.current and state.adequate and state.task_completed:
-                return "✓ Verified"
+                return "✓ 已验证"
             if state.required and not state.current:
-                return "⚠ Stale"
-            return "● Ready"
+                return "⚠ 验证已失效"
+            return "● 就绪"
 
         @Slot()
         def _focus_file_filter(self) -> None:
@@ -497,7 +514,7 @@ if QObject is not None:
         def _open_workspace(self) -> None:
             selected = QFileDialog.getExistingDirectory(
                 self,
-                "Open Workspace",
+                "打开工作区",
                 config.WORKSPACE_DIR,
             )
             if selected:
@@ -507,13 +524,13 @@ if QObject is not None:
         def _open_recent_workspace(self) -> None:
             recent = self.recent_store.load()
             if not recent:
-                QMessageBox.information(self, "Recent Workspaces", "No recent workspaces yet.")
+                QMessageBox.information(self, "最近使用的工作区", "还没有最近使用的工作区。")
                 return
             labels = [f"{Path(path).name}  —  {path}" for path in recent]
             selected, ok = QInputDialog.getItem(
                 self,
-                "Recent Workspaces",
-                "Open:",
+                "最近使用的工作区",
+                "选择要打开的工作区：",
                 labels,
                 0,
                 False,
@@ -525,7 +542,7 @@ if QObject is not None:
             try:
                 resolved = switch_workspace(workspace, running=self._running)
             except WorkspaceDataError as exc:
-                QMessageBox.warning(self, "Workspace", str(exc))
+                QMessageBox.warning(self, "工作区", str(exc))
                 return
             config.WORKSPACE_DIR = str(resolved)
             self.active = None
@@ -534,7 +551,7 @@ if QObject is not None:
                 self.recent_store.remember(resolved)
             except OSError as exc:
                 self.presenter.consume(
-                    {"event": "gui_error", "message": f"Could not save recent workspace: {exc}"}
+                    {"event": "gui_error", "message": f"无法保存最近使用的工作区：{exc}"}
                 )
             self.file_filter.clear()
             self._refresh_project_files()
@@ -545,7 +562,57 @@ if QObject is not None:
                 self._all_project_entries = project_entries(config.WORKSPACE_DIR)
             except WorkspaceDataError:
                 self._all_project_entries = []
+            self._sync_project_watcher()
             self._filter_project_files(self.file_filter.text() if hasattr(self, "file_filter") else "")
+
+        @Slot(str)
+        def _schedule_project_refresh(self, _changed_directory: str) -> None:
+            """Coalesce bursts of file-system notifications into one tree refresh."""
+
+            self._project_refresh_timer.start()
+
+        def _sync_project_watcher(self) -> None:
+            """Watch the workspace and every currently visible directory."""
+
+            if not hasattr(self, "_project_watcher"):
+                return
+            try:
+                root = Path(config.WORKSPACE_DIR).resolve()
+            except OSError:
+                return
+            desired = {str(root)} if root.is_dir() else set()
+            for entry in self._all_project_entries:
+                if not entry.is_directory:
+                    continue
+                path = (root / entry.path).resolve(strict=False)
+                try:
+                    path.relative_to(root)
+                except ValueError:
+                    continue
+                if path.is_dir():
+                    desired.add(str(path))
+
+            current = set(self._project_watcher.directories())
+            stale = sorted(current - desired)
+            missing = sorted(desired - current)
+            if stale:
+                self._project_watcher.removePaths(stale)
+            if missing:
+                self._project_watcher.addPaths(missing)
+
+        def _expanded_project_paths(self) -> set[str]:
+            if not hasattr(self, "project_tree"):
+                return set()
+            expanded: set[str] = set()
+            root = self.project_tree.invisibleRootItem()
+            pending = [root.child(index) for index in range(root.childCount())]
+            while pending:
+                item = pending.pop()
+                path = item.data(0, PROJECT_NODE_PATH_ROLE)
+                if item.isExpanded() and isinstance(path, str):
+                    expanded.add(path)
+                pending.extend(item.child(index) for index in range(item.childCount()))
+            return expanded
 
         @Slot(str)
         def _filter_project_files(self, query: str) -> None:
@@ -556,6 +623,7 @@ if QObject is not None:
                 entry for entry in self._all_project_entries
                 if not needle or needle in entry.path.casefold()
             ]
+            expanded = self._expanded_project_paths()
             self.project_tree.clear()
             nodes: dict[str, QTreeWidgetItem] = {}
             for entry in entries:
@@ -569,6 +637,9 @@ if QObject is not None:
                     if item is None:
                         item = QTreeWidgetItem([part])
                         parent.addChild(item)
+                        item.setData(0, PROJECT_NODE_PATH_ROLE, key)
+                        if key in expanded:
+                            item.setExpanded(True)
                         nodes[key] = item
                     if index == len(parts) - 1 and not entry.is_directory:
                         item.setData(0, Qt.ItemDataRole.UserRole, entry.path)
@@ -585,10 +656,10 @@ if QObject is not None:
             try:
                 text, truncated = read_workspace_text(config.WORKSPACE_DIR, relative)
             except WorkspaceDataError as exc:
-                QMessageBox.warning(self, "File Preview", str(exc))
+                QMessageBox.warning(self, "文件预览", str(exc))
                 return
             if truncated:
-                text += "\n\n[preview truncated]"
+                text += "\n\n[预览内容已截断]"
             self._show_text_dialog(relative, text)
 
         @Slot(QListWidgetItem)
@@ -597,8 +668,8 @@ if QObject is not None:
             if not isinstance(relative, str) or self.active is None:
                 QMessageBox.information(
                     self,
-                    "Diff",
-                    "A trusted diff is available after this Agent session creates a file checkpoint.",
+                    "差异",
+                    "当前 Agent 会话创建文件检查点后，才能查看可信差异。",
                 )
                 return
             try:
@@ -607,25 +678,25 @@ if QObject is not None:
                     start_index=self.active.st.turn_checkpoint_index,
                 )
             except CheckpointError as exc:
-                QMessageBox.information(self, "Diff unavailable", str(exc))
+                QMessageBox.information(self, "无法查看差异", str(exc))
                 return
-            self._show_text_dialog(f"Diff — {relative}", diff.text)
+            self._show_text_dialog(f"差异 — {relative}", diff.text)
 
         @Slot()
         def _restore_task_changes(self) -> None:
             if self._running or self.active is None:
                 QMessageBox.information(
                     self,
-                    "Restore Task Changes",
-                    "No completed Agent task is available to restore.",
+                    "恢复任务改动",
+                    "当前没有可恢复的已完成 Agent 任务。",
                 )
                 return
             answer = QMessageBox.question(
                 self,
-                "Restore Task Changes",
-                "Restore this task's direct Agent file edits?\n\n"
-                "Shell side effects are outside Checkpoint guarantees. Any file changed "
-                "after the Agent edit will cause the restore to be refused.",
+                "恢复任务改动",
+                "要恢复本次任务由 Agent 文件工具直接造成的改动吗？\n\n"
+                "Checkpoint 不保证恢复 Shell 命令的副作用。若文件在 Agent 编辑后又被修改，"
+                "恢复操作将被拒绝，以保护后续内容。",
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
@@ -633,7 +704,7 @@ if QObject is not None:
                 logger = RunLog(event_sink=self._consume_event)
                 self.runtime._restore_task_changes(self.active, logger=logger)
             except (CheckpointError, OSError) as exc:
-                QMessageBox.warning(self, "Restore refused", str(exc))
+                QMessageBox.warning(self, "恢复被拒绝", str(exc))
                 return
             self._refresh_project_files()
             self._render_all()
@@ -644,14 +715,14 @@ if QObject is not None:
             if not isinstance(report, dict):
                 QMessageBox.information(
                     self,
-                    "Export Evidence Report",
-                    "Run or resume a task before exporting its Runtime evidence.",
+                    "导出证据报告",
+                    "请先运行或恢复一个任务，再导出 Runtime 证据。",
                 )
                 return
             default = str(Path(config.WORKSPACE_DIR) / "agent-evidence-report.md")
             selected, _filter = QFileDialog.getSaveFileName(
                 self,
-                "Export Evidence Report",
+                "导出证据报告",
                 default,
                 "Markdown (*.md)",
             )
@@ -664,9 +735,9 @@ if QObject is not None:
                     newline="\n",
                 )
             except OSError as exc:
-                QMessageBox.warning(self, "Export failed", str(exc))
+                QMessageBox.warning(self, "导出失败", str(exc))
                 return
-            QMessageBox.information(self, "Evidence Report", f"Saved to:\n{selected}")
+            QMessageBox.information(self, "证据报告", f"已保存到：\n{selected}")
 
         @Slot(QUrl)
         def _open_activity_link(self, url: QUrl) -> None:
@@ -683,11 +754,11 @@ if QObject is not None:
                     60_000,
                 )
             except (OSError, ValueError) as exc:
-                QMessageBox.warning(self, "Command Output", str(exc))
+                QMessageBox.warning(self, "命令输出", str(exc))
                 return
             if len(text) < total:
-                text += f"\n\n[showing {len(text)} of {total} characters]"
-            self._show_text_dialog(f"Command Output — {output_id}", text)
+                text += f"\n\n[当前显示 {len(text)} / {total} 个字符]"
+            self._show_text_dialog(f"命令输出 — {output_id}", text)
 
         def _show_text_dialog(self, title: str, text: str) -> None:
             dialog = QDialog(self)
@@ -698,7 +769,7 @@ if QObject is not None:
             viewer.setReadOnly(True)
             viewer.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
             viewer.setPlainText(_redact(text))
-            close = QPushButton("Close")
+            close = QPushButton("关闭")
             close.clicked.connect(dialog.accept)
             layout.addWidget(viewer, 1)
             layout.addWidget(close)
@@ -707,14 +778,14 @@ if QObject is not None:
         @Slot()
         def _show_history(self) -> None:
             if self._running:
-                QMessageBox.information(self, "History", "Stop the current task before resuming history.")
+                QMessageBox.information(self, "历史记录", "请先停止当前任务，再恢复历史会话。")
                 return
             summaries = SessionStore.summaries(config.WORKSPACE_DIR, limit=30)
             if not summaries:
-                QMessageBox.information(self, "History", "No readable sessions in this workspace.")
+                QMessageBox.information(self, "历史记录", "当前工作区没有可读取的历史会话。")
                 return
             dialog = QDialog(self)
-            dialog.setWindowTitle("Session History")
+            dialog.setWindowTitle("会话历史")
             dialog.resize(820, 520)
             layout = QHBoxLayout(dialog)
             sessions = QListWidget()
@@ -723,8 +794,8 @@ if QObject is not None:
             layout.addWidget(sessions, 2)
             right = QVBoxLayout()
             right.addWidget(details, 1)
-            resume = QPushButton("Resume")
-            close = QPushButton("Close")
+            resume = QPushButton("恢复")
+            close = QPushButton("关闭")
             buttons = QHBoxLayout()
             buttons.addWidget(resume)
             buttons.addWidget(close)
@@ -748,18 +819,18 @@ if QObject is not None:
                 summary = by_id[str(selected.data(Qt.ItemDataRole.UserRole))]
                 outcome = summary.get("outcome")
                 lines = [
-                    f"Task: {summary['task']}",
-                    f"Model: {summary['model'] or 'unknown'}",
-                    f"Updated: {summary['updated']:%Y-%m-%d %H:%M:%S}",
-                    f"Status: {summary['status']}",
+                    f"任务：{summary['task']}",
+                    f"模型：{summary['model'] or '未知'}",
+                    f"更新时间：{summary['updated']:%Y-%m-%d %H:%M:%S}",
+                    f"状态：{_status_zh(str(summary['status']))}",
                 ]
                 if isinstance(outcome, dict):
                     lines.extend([
                         "",
                         str(outcome.get("text", "")),
                         "",
-                        f"Steps: {outcome.get('steps', 0)}",
-                        f"Changed files: {len(outcome.get('changes', [])) if isinstance(outcome.get('changes'), list) else 0}",
+                        f"步骤：{outcome.get('steps', 0)}",
+                        f"改动文件：{len(outcome.get('changes', [])) if isinstance(outcome.get('changes'), list) else 0}",
                     ])
                 details.setPlainText(_redact("\n".join(lines)))
 
@@ -798,7 +869,7 @@ if QObject is not None:
             blocks = [_activity_html(item) for item in self.presenter.activity]
             if self.presenter.outcome.visible:
                 blocks.append(_outcome_html(self.presenter.outcome, self.presenter.verification))
-            content = "".join(blocks) or '<div class="empty">Enter a programming task to begin.</div>'
+            content = "".join(blocks) or '<div class="empty">输入编程任务即可开始。</div>'
             self.activity.setHtml(_activity_document(content))
             bar = self.activity.verticalScrollBar()
             bar.setValue(bar.maximum())
@@ -824,9 +895,9 @@ if QObject is not None:
                     widget.deleteLater()
             total = len(self.presenter.plan)
             completed = sum(item.status == "completed" for item in self.presenter.plan)
-            self.plan_title.setText(f"Plan  {completed} / {total}" if total else "Plan")
+            self.plan_title.setText(f"计划  {completed} / {total}" if total else "计划")
             if not self.presenter.plan:
-                empty = QLabel("No active plan")
+                empty = QLabel("当前没有计划")
                 empty.setObjectName("muted")
                 self.plan_layout.addWidget(empty)
                 return
@@ -841,50 +912,50 @@ if QObject is not None:
         def _render_verification(self) -> None:
             state = self.presenter.verification
             rows = [
-                _metric("Workspace rev", str(state.workspace_revision)),
-                _metric("Verified rev", str(state.verified_revision) if state.verified_revision >= 0 else "—"),
-                _metric("Checks", str(state.check_attempts)),
-                _metric("Progress", state.progress.upper()),
+                _metric("工作区版本", str(state.workspace_revision)),
+                _metric("已验证版本", str(state.verified_revision) if state.verified_revision >= 0 else "—"),
+                _metric("检查次数", str(state.check_attempts)),
+                _metric("修复进度", _status_zh(state.progress)),
             ]
             if state.verifier:
                 rows.append(
-                    f'<div style="color:{COLORS["muted"]}; margin-top:10px">Verifier</div>'
+                    f'<div style="color:{COLORS["muted"]}; margin-top:10px">验证命令</div>'
                     f'<div style="margin:3px 0 10px 0">{html.escape(state.verifier)}</div>'
                 )
             if state.current and state.adequate and state.task_completed:
-                rows.append(_metric("Fingerprint", "MATCHED", "success"))
+                rows.append(_metric("工作区指纹", "匹配", "success"))
                 rows.append(
                     f'<div style="color:{COLORS["success"]}; font-weight:700; margin-top:12px">'
-                    '✓ FINAL VERIFIED</div>'
+                    '✓ 最终验证通过</div>'
                 )
             elif state.current and not state.adequate:
-                rows.append(_metric("Fingerprint", "MATCHED", "success"))
+                rows.append(_metric("工作区指纹", "匹配", "success"))
                 rows.append(
                     f'<div style="color:{COLORS["warning"]}; font-weight:700; margin-top:12px">'
-                    'PARTIALLY VERIFIED</div>'
-                    f'<div style="color:{COLORS["muted"]}">Full-suite verification was not completed</div>'
+                    '部分验证通过</div>'
+                    f'<div style="color:{COLORS["muted"]}">尚未完成全量测试验证</div>'
                 )
             elif state.current:
-                rows.append(_metric("Fingerprint", "MATCHED", "success"))
+                rows.append(_metric("工作区指纹", "匹配", "success"))
                 rows.append(
                     f'<div style="color:{COLORS["success"]}; font-weight:700; margin-top:12px">'
-                    'LAST VERIFICATION CURRENT</div>'
-                    f'<div style="color:{COLORS["muted"]}">Task has not completed</div>'
+                    '最近一次验证仍有效</div>'
+                    f'<div style="color:{COLORS["muted"]}">任务尚未完成</div>'
                 )
             elif state.required:
                 rows.append(
-                    f'<div style="color:{COLORS["warning"]}; font-weight:700; margin-top:12px">STALE</div>'
-                    f'<div style="color:{COLORS["muted"]}">Re-verification required</div>'
+                    f'<div style="color:{COLORS["warning"]}; font-weight:700; margin-top:12px">验证已失效</div>'
+                    f'<div style="color:{COLORS["muted"]}">需要重新验证</div>'
                 )
             else:
                 rows.append(
                     f'<div style="color:{COLORS["muted"]}; margin-top:12px">'
-                    'No verification required yet</div>'
+                    '当前尚不需要验证</div>'
                 )
             if not state.tracking_complete:
                 rows.append(
                     f'<div style="color:{COLORS["warning"]}; margin-top:8px">'
-                    'Workspace tracking is bounded</div>'
+                    '工作区跟踪处于受限模式</div>'
                 )
             metrics = "".join(row for row in rows if row.startswith("<tr"))
             details = "".join(row for row in rows if not row.startswith("<tr"))
@@ -899,8 +970,8 @@ if QObject is not None:
             if self._running:
                 QMessageBox.information(
                     self,
-                    "Agent is running",
-                    "Wait for the current task or approval request to finish before closing.",
+                    "Agent 正在运行",
+                    "请等待当前任务或确认请求结束后再关闭窗口。",
                 )
                 event.ignore()
                 return
@@ -912,8 +983,8 @@ def launch(runtime_module: Any = None, *, prefer_recent: bool = False) -> int:
 
     if QObject is None:
         print(
-            "PySide6 is required for the desktop GUI. "
-            'Install it with: python -m pip install -e ".[gui]"',
+            "桌面 GUI 需要 PySide6。"
+            '请执行：python -m pip install -e ".[gui]"',
             file=sys.stderr,
         )
         return 2
@@ -930,11 +1001,11 @@ def launch(runtime_module: Any = None, *, prefer_recent: bool = False) -> int:
         config.get_api_key()
         config.get_model()
     except RuntimeError as exc:
-        QMessageBox.critical(None, "Configuration error", str(exc))
+        QMessageBox.critical(None, "配置错误", str(exc))
         return 2
     workspace = Path(config.WORKSPACE_DIR)
     if not workspace.is_dir():
-        QMessageBox.critical(None, "Workspace error", f"Workspace does not exist:\n{workspace}")
+        QMessageBox.critical(None, "工作区错误", f"工作区不存在：\n{workspace}")
         return 2
 
     ui.set_output_enabled(False)
@@ -952,11 +1023,11 @@ def _activity_html(item: ActivityItem) -> str:
     if item.kind == "task":
         return f'<div class="task"><span class="task-mark">❯</span> {title}</div>'
     if item.kind == "file" and item.change is not None:
-        labels = {"added": "Added", "modified": "Modified", "deleted": "Deleted", "changed": "Changed"}
+        labels = {"added": "新增", "modified": "修改", "deleted": "删除", "changed": "变更"}
         stats = _stats(item.change.additions, item.change.deletions)
         return (
             '<div class="file-change">'
-            f'<div><span class="file-label">{labels.get(item.change.kind, "Changed")}</span> '
+            f'<div><span class="file-label">{labels.get(item.change.kind, "变更")}</span> '
             f'<span class="path">{title}</span></div>{stats}</div>'
         )
     if item.kind == "completion":
@@ -965,7 +1036,7 @@ def _activity_html(item: ActivityItem) -> str:
     symbols = {"success": "✓", "failure": "✗", "warning": "⚠", "running": "•", "neutral": "•", "accent": "•"}
     symbol = symbols.get(item.tone, "•")
     output = (
-        f'<div class="detail"><a href="output:{html.escape(item.output_ref)}">View output</a></div>'
+        f'<div class="detail"><a href="output:{html.escape(item.output_ref)}">查看完整输出</a></div>'
         if item.output_ref
         else ""
     )
@@ -974,38 +1045,55 @@ def _activity_html(item: ActivityItem) -> str:
 
 def _outcome_html(outcome: OutcomeView, verification) -> str:
     labels = {
-        "final_verified": ("✓ Task Completed", "✓ FINAL VERIFIED", "success"),
-        "partial": ("⚠ Task Completed", "PARTIALLY VERIFIED", "warning"),
-        "stale": ("⚠ Task Completed", "VERIFICATION STALE", "warning"),
-        "stopped": ("■ Task stopped", "NOT FINAL VERIFIED", "warning"),
-        "restored": ("↶ Task changes restored", "VERIFICATION STALE", "warning"),
-        "completed": ("✓ Task Completed", "No verification required", "success"),
+        "final_verified": ("✓ 任务完成", "✓ 最终验证通过", "success"),
+        "partial": ("⚠ 任务完成", "部分验证通过", "warning"),
+        "stale": ("⚠ 任务完成", "验证已失效", "warning"),
+        "stopped": ("■ 任务已停止", "未通过最终验证", "warning"),
+        "restored": ("↶ 已恢复任务改动", "验证已失效", "warning"),
+        "completed": ("✓ 任务完成", "无需验证", "success"),
     }
     title, status, tone = labels.get(
         outcome.status,
-        ("Task outcome", "Unknown", "warning"),
+        ("任务结果", "未知", "warning"),
     )
     additions = "—" if outcome.additions is None else f"+{outcome.additions}"
     deletions = "—" if outcome.deletions is None else f"-{outcome.deletions}"
     elapsed = f"{outcome.elapsed_seconds:.1f}s" if outcome.elapsed_seconds is not None else "—"
     rows = [
-        _metric("Changed", f"{outcome.changed_files} files"),
-        _metric("Added", additions),
-        _metric("Removed", deletions),
-        _metric("Steps", str(outcome.steps)),
-        _metric("Model calls", str(outcome.model_calls)),
-        _metric("Tool calls", str(outcome.tool_calls)),
-        _metric("Checks", str(outcome.checks)),
-        _metric("Tokens", _token_count(outcome.tokens)),
-        _metric("Duration", elapsed),
-        _metric("Workspace rev", str(verification.workspace_revision)),
+        _metric("改动文件", f"{outcome.changed_files} 个"),
+        _metric("新增行", additions),
+        _metric("删除行", deletions),
+        _metric("执行步骤", str(outcome.steps)),
+        _metric("模型调用", str(outcome.model_calls)),
+        _metric("工具调用", str(outcome.tool_calls)),
+        _metric("验证次数", str(outcome.checks)),
+        _metric("总 Token", _token_count(outcome.tokens)),
+        _metric("输入 Token", _token_count(outcome.prompt_tokens)),
+        _metric("输出 Token", _token_count(outcome.completion_tokens)),
+        *(
+            [_metric("缓存命中", _token_count(outcome.cache_hit_tokens))]
+            if outcome.cache_hit_tokens is not None
+            else []
+        ),
+        *(
+            [_metric("缓存未命中", _token_count(outcome.cache_miss_tokens))]
+            if outcome.cache_miss_tokens is not None
+            else []
+        ),
+        *(
+            [_metric("推理 Token", _token_count(outcome.reasoning_tokens))]
+            if outcome.reasoning_tokens is not None
+            else []
+        ),
+        _metric("用时", elapsed),
+        _metric("工作区版本", str(verification.workspace_revision)),
         _metric(
-            "Verified rev",
+            "已验证版本",
             str(verification.verified_revision) if verification.verified_revision >= 0 else "—",
         ),
-        _metric("Fingerprint", "MATCH" if verification.fingerprint_matched else "—"),
-        _metric("Scope", (verification.verified_scope or "none").upper()),
-        _metric("Progress", outcome.repair_progress.upper()),
+        _metric("工作区指纹", "匹配" if verification.fingerprint_matched else "—"),
+        _metric("验证范围", _status_zh(verification.verified_scope or "none")),
+        _metric("修复进度", _status_zh(outcome.repair_progress)),
     ]
     return (
         f'<div class="outcome {tone}"><div class="outcome-title">{html.escape(title)}</div>'
@@ -1018,19 +1106,40 @@ def _outcome_html(outcome: OutcomeView, verification) -> str:
 
 def _stats(additions: int | None, deletions: int | None) -> str:
     if additions is None or deletions is None:
-        return '<div class="stats muted">line counts unavailable</div>'
+        return '<div class="stats muted">无法统计行数</div>'
     parts = []
     if additions:
         parts.append(f'<span class="plus">+{additions}</span>')
     if deletions:
         parts.append(f'<span class="minus">-{deletions}</span>')
-    return f'<div class="stats">{"&nbsp;&nbsp;".join(parts) or "no line-count change"}</div>'
+    return f'<div class="stats">{"&nbsp;&nbsp;".join(parts) or "行数未变化"}</div>'
 
 
 def _token_count(value: int) -> str:
     if value >= 1_000:
         return f"{value / 1_000:.1f}k"
     return str(value)
+
+
+def _status_zh(value: str) -> str:
+    """Translate stable Runtime status codes without touching technical output."""
+
+    normalized = value.strip().casefold()
+    return {
+        "verified": "已验证",
+        "completed": "已完成",
+        "stopped": "已停止",
+        "unknown": "未知",
+        "passed": "通过",
+        "failed": "失败",
+        "warning": "需要关注",
+        "no_progress": "无进展",
+        "not_checked": "未检查",
+        "full": "全量",
+        "targeted": "局部",
+        "unknown_scope": "范围未知",
+        "none": "无",
+    }.get(normalized, value)
 
 
 def _activity_document(body: str) -> str:
@@ -1083,10 +1192,37 @@ def _approval_parts(prompt: str) -> tuple[str, dict[str, str]]:
     for line in prompt.splitlines():
         match = re.match(r"\s*\[([123])\]\s*(.+)", line)
         if match:
-            options[match.group(1)] = match.group(2).strip()
+            options[match.group(1)] = _approval_label_zh(match.group(2).strip())
         elif not line.strip().lower().startswith("choose ["):
             body.append(line)
-    return "\n".join(body).strip(), options
+    translated = "\n".join(body).strip()
+    replacements = {
+        "Command requires approval:": "命令需要确认：",
+        "Permission required for": "修改文件需要确认：",
+        "unrecognized command requires approval": "该命令尚未识别，需要确认",
+        "manual mode requires command approval": "手动权限模式要求确认命令",
+        "manual mode requires edit approval": "手动权限模式要求确认文件修改",
+    }
+    for source, target in replacements.items():
+        translated = translated.replace(source, target)
+    return translated, options
+
+
+def _approval_label_zh(label: str) -> str:
+    replacements = (
+        ("Allow this command family for the session:", "本次会话允许此命令系列："),
+        ("Deny this command family for the session:", "本次会话拒绝此命令系列："),
+        ("Allow edits to this file for the session", "本次会话允许修改此文件"),
+        ("Allow clean-file edits for the session", "本次会话允许修改未预先变更的文件"),
+        ("Allow this edit once", "仅允许本次修改"),
+        ("Allow once", "仅允许一次"),
+        ("Deny once", "本次拒绝"),
+        ("Deny", "拒绝"),
+    )
+    for source, target in replacements:
+        if label.startswith(source):
+            return target + label[len(source):]
+    return label
 
 
 def _redact(value: str) -> str:
