@@ -177,8 +177,8 @@ python .\evals\run_eval.py --case percentage-pricing --repeat 3
 
 | Run | Result | Scope |
 | --- | ---: | --- |
-| Local hidden repair suite | **7/8 (87.5%)** | 8 个隔离修复任务，Agent 退出后运行 hidden grader |
-| BigCodeBench Instruct | **12/30 (40.0%)** | 固定标准库子集，官方远程 evaluator，Pass@1 |
+| Local hidden repair suite | **8/8 (100%)** | 8 个隔离修复任务，Agent 退出后运行 hidden grader |
+| BigCodeBench Instruct | **15/30 (50.0%)** | 固定标准库子集，官方远程 evaluator，Pass@1 |
 
 完整配置、任务级结果和解释见 [`evals/BENCHMARK_RESULTS.md`](evals/BENCHMARK_RESULTS.md)，冻结规则见 [`evals/BENCHMARK_PROTOCOL.md`](evals/BENCHMARK_PROTOCOL.md)。BigCodeBench 数字是确定性的 30 题 Pilot，不是完整排行榜成绩。
 
